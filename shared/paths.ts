@@ -23,14 +23,34 @@ export const DEFAULT_IGNORE = [
   '*~',
 ]
 
+/**
+ * A name as macOS compares it: APFS and HFS+ ignore case, and HFS+ also ignores invisible
+ * characters such as U+200C, so ".GIT" and ".g\u200cit" are the folder ".git" on a Mac.
+ */
+const fold = (name: string) => name.normalize('NFC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').toLowerCase()
+const hard = (name: string) => HARD.has(fold(name))
+
 /** Canonical relative POSIX path in NFC, or throws. The result cannot climb out of a root. */
 export function cleanPath(p: unknown): string {
   if (typeof p !== 'string') throw new Error('path must be a string')
   const n = p.normalize('NFC')
   const parts = n.split('/')
-  if (n.length > 1024 || n.includes('\0') || parts.some(s => s === '' || s === '.' || s === '..' || HARD.has(s)))
+  // control characters: no real file needs them, and they could forge lines in logs and the TUI
+  if (n.length > 1024 || /[\x00-\x1f\x7f]/.test(n) || parts.some(s => s === '' || s === '.' || s === '..' || hard(s)))
     throw new Error(`invalid path ${JSON.stringify(p)}`)
   return n
+}
+
+/** Whether the absolute path `real` (already symlink-resolved) is `root` or inside it. */
+export const within = (root: string, real: string) => real === root || real.startsWith(root.endsWith('/') ? root : root + '/')
+
+/**
+ * A safe folder name for a project name chosen on another Mac: one plain path segment that is
+ * not hidden, so it can't be "..", "~/.ssh" or a path. Falls back to "project".
+ */
+export function folderName(name: string) {
+  const n = name.normalize('NFC').replace(/[\x00-\x1f\x7f/:\\]/g, '-').replace(/^[\s.]+/, '').trim().slice(0, 100).trim()
+  return n || 'project'
 }
 
 export type Ignore = (path: string, isDir?: boolean) => boolean
@@ -48,7 +68,7 @@ export function ignoreRules(text = ''): Ignore {
   const hit = (s: string) => rules.reduce((ignored, r) => (r.re.test(s) ? !r.neg : ignored), false)
   return (path, isDir = false) => {
     const parts = path.split('/')
-    if (parts.some(s => HARD.has(s))) return true
+    if (parts.some(hard)) return true
     for (let i = 1; i <= parts.length; i++)
       if (hit(parts.slice(0, i).join('/') + (i < parts.length || isDir ? '/' : ''))) return true
     return false

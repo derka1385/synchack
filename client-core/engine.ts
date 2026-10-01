@@ -14,7 +14,7 @@ import { link, lstat, mkdir, readdir, readFile, realpath, rename, rm, rmdir, wri
 import { basename, dirname, join, sep } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { MAX_FILE, sha256, type Conflict, type Hash, type Head, type Member, type Mode, type Op, type OpResult, type ServerMsg } from '../shared/protocol.ts'
-import { cleanPath, ignoreRules, type Ignore } from '../shared/paths.ts'
+import { cleanPath, ignoreRules, within, type Ignore } from '../shared/paths.ts'
 import type { LocalState, Project } from './state.ts'
 import { WebSocket, type ClientOptions } from 'ws'
 import { ConnectError, pinnedCert, request, trust, type Peer } from './net.ts'
@@ -331,8 +331,11 @@ export class ProjectSync extends EventEmitter {
       const st = await lstat(abs)
       if (!st.isFile()) return null
       if (st.size > MAX_FILE) throw new Error('larger than 100 MB, not synced')
+      const real = await realpath(abs)
+      // a symlinked folder on the way: whatever is behind it is not part of the project
+      if (!within(this.root, real)) return null
       // APFS ignores case: "readme.md" must not be read through a file named "README.md"
-      if (basename(await realpath(abs)).normalize('NFC') !== basename(path)) return null
+      if (basename(real).normalize('NFC') !== basename(path)) return null
       const bytes = await readFile(abs)
       const hash = sha256(bytes)
       this.scanned.set(path, { size: st.size, mtimeMs: st.mtimeMs, hash }) // stat taken before the read
@@ -522,6 +525,7 @@ export class ProjectSync extends EventEmitter {
     const now = async () => (await this.read(path))?.hash ?? null
     if (bytes === null) {
       if ((await now()) !== expect) return false
+      await this.inside(path)
       await rm(abs, { force: true })
       await this.prune(path)
       return true
@@ -533,6 +537,7 @@ export class ProjectSync extends EventEmitter {
     try {
       // ponytail: a write landing between this check and the rename is lost locally (microseconds)
       if ((await now()) !== expect) return false
+      await this.inside(path) // again, now that the folders exist: nothing swapped in a symlink meanwhile
       if (expect === null) await link(tmp, abs) // atomic create; fails if a file appeared meanwhile
       else await rename(tmp, abs) // atomic replace: readers see old or new, never half a file
       return true
@@ -544,12 +549,13 @@ export class ProjectSync extends EventEmitter {
     }
   }
 
-  /** Refuses writes that would leave the project through a symlinked folder. */
+  /** Refuses writes that would leave the project through a symlinked folder, dangling ones included. */
   private async inside(path: string) {
     let dir = dirname(join(this.root, path))
-    while (!existsSync(dir)) dir = dirname(dir)
-    const real = await realpath(dir)
-    if (real !== this.root && !real.startsWith(this.root + sep)) throw new Error('resolves outside the project folder; not written')
+    // the nearest folder that exists; lstat, so a dangling symlink counts as existing
+    while (!(await lstat(dir).catch(() => null))) dir = dirname(dir)
+    const real = await realpath(dir).catch(() => null)
+    if (!real || !within(this.root, real)) throw new Error('resolves outside the project folder; not written')
   }
 
   private async prune(path: string) {

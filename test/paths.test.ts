@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { cleanPath, ignoreRules } from '../shared/paths.ts'
+import { cleanPath, folderName, ignoreRules, within } from '../shared/paths.ts'
 
 test('cleanPath rejects anything that could leave the project', () => {
   for (const bad of ['', '/etc/passwd', '../x', 'a/../../b', 'a//b', 'a/', './a', '.git/config', 'sub/.git/HEAD', '.synchack/tmp/x', 'a\0b', 5, null])
@@ -30,4 +30,29 @@ test('.synchackignore rules', () => {
   assert.ok(ig('gen/x'))
   assert.ok(ig('x.tmp'))
   assert.ok(ig('node_modules/keep.js'), 'nothing inside an ignored folder can be re-included')
+})
+
+test('cleanPath refuses every spelling of .git and .synchack that a Mac treats as the real one', () => {
+  for (const bad of ['.GIT/hooks/pre-commit', '.Git/config', 'sub/.gIt/HEAD', '.g\u200cit/config', '.git\ufeff/x', '.SyncHack/tmp/x', 'a\nb.txt', 'a\rb', 'x\x7f'])
+    assert.throws(() => cleanPath(bad), JSON.stringify(bad))
+  for (const ok of ['.github/workflows/ci.yml', '.gitignore', 'git/x', '.synchackignore', 'docs/.gitkeep'])
+    assert.equal(cleanPath(ok), ok)
+  const ig = ignoreRules()
+  assert.ok(ig('.GIT/HEAD') && ig('a/.Synchack/x'))
+})
+
+test('within', () => {
+  assert.ok(within('/u/p', '/u/p') && within('/u/p', '/u/p/a/b'))
+  assert.ok(!within('/u/p', '/u/p2/a') && !within('/u/p', '/u') && !within('/u/p', '/etc/passwd'))
+})
+
+test('folderName turns a remote project name into one plain visible folder', () => {
+  assert.equal(folderName('Hack Night'), 'Hack Night')
+  assert.equal(folderName('..'), 'project')
+  assert.equal(folderName('.ssh'), 'ssh')
+  assert.equal(folderName('../../Library/LaunchAgents'), '-..-Library-LaunchAgents')
+  assert.equal(folderName('/etc'), '-etc')
+  assert.equal(folderName('a\nb:c'), 'a-b-c')
+  assert.equal(folderName('   '), 'project')
+  assert.ok(folderName('x'.repeat(500)).length <= 100)
 })

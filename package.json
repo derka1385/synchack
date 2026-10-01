@@ -1,0 +1,31 @@
+{
+  "name": "synchack",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Keeps one real project folder in sync across a small team's Macs, so every coding agent edits plain local files.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "synchack": "client-core/cli.ts"
+  },
+  "scripts": {
+    "server": "node server/server.ts",
+    "cli": "node client-core/cli.ts",
+    "test": "node --test --test-concurrency=1 \"test/*.test.ts\"",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "ink": "^7.1.1",
+    "react": "^19.3.0",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/ws": "^8.18.2",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^7.0.2"
+  }
+}

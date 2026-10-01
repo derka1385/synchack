@@ -1,0 +1,252 @@
+// HTTP for commands and blobs, one WebSocket per client for pushed events.
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createReadStream } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import type { AddressInfo } from 'node:net'
+import { WebSocketServer, type WebSocket } from 'ws'
+import { HASH_RE, MAX_FILE, lanAddresses, sha256, type Member, type ServerMsg } from '../shared/protocol.ts'
+import { Store, type Device } from './store.ts'
+
+class HttpError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.status = status
+  }
+}
+
+export interface Server {
+  url: string
+  port: number
+  store: Store
+  close(): Promise<void>
+}
+
+export async function startServer({ port = 8787, dataDir = 'data' } = {}): Promise<Server> {
+  const store = new Store(dataDir)
+  const rooms = new Map<string, Map<WebSocket, { me: Device; alive: boolean }>>()
+  let closing = false
+
+  const send = (project: string, msg: ServerMsg) => {
+    const s = JSON.stringify(msg)
+    for (const ws of rooms.get(project)?.keys() ?? []) ws.send(s)
+  }
+  const members = (project: string): Member[] => {
+    const online = new Set([...(rooms.get(project)?.values() ?? [])].map(s => s.me.device))
+    return store.members(project).map(m => ({ ...m, online: online.has(m.device) }))
+  }
+
+  const http = createServer((req, res) => {
+    route(req, res).catch(e => {
+      if (res.headersSent) return res.destroy()
+      reply(res, e.status ?? (e instanceof SyntaxError ? 400 : 500), { error: e.message })
+    })
+  })
+
+  async function route(req: IncomingMessage, res: ServerResponse) {
+    const url = new URL(req.url ?? '/', 'http://x')
+    const key = `${req.method} ${url.pathname}`
+    if (key === 'GET /health') return reply(res, 200, { ok: true })
+    // Teammates install synchack from this Mac: curl -fsSL http://<ip>:8787/install | sh
+    if (key === 'GET /install') {
+      res.writeHead(200, { 'content-type': 'text/x-shellscript' })
+      return void res.end(installScript(`http://${req.headers.host}`))
+    }
+    if (key === 'GET /install.tgz') {
+      res.writeHead(200, { 'content-type': 'application/gzip' })
+      const tar = spawn('tar', ['-cz', '-C', APP, 'package.json', 'package-lock.json', 'shared', 'server', 'client-core'], { stdio: ['ignore', 'pipe', 'ignore'] })
+      return void tar.stdout.pipe(res)
+    }
+    if (key === 'POST /api/projects') {
+      const b = await json(req)
+      return reply(res, 200, store.createProject(text(b.name, 'name'), who(b)))
+    }
+    if (key === 'POST /api/join') {
+      const b = await json(req)
+      const r = store.join(text(b.code, 'code'), who(b))
+      if (!r) throw new HttpError(404, 'unknown join code')
+      return reply(res, 200, r)
+    }
+
+    const m = url.pathname.match(/^\/api\/p\/([\w-]{1,64})(\/.*)$/)
+    if (!m) throw new HttpError(404, 'not found')
+    const [, project, rest] = m
+    const me = store.auth(project, req.headers.authorization?.replace(/^Bearer /, '') ?? null)
+    if (!me) throw new HttpError(401, 'not a member of this project')
+
+    if (rest === '/ops' && req.method === 'POST') {
+      const { ops } = await json(req)
+      if (!Array.isArray(ops) || ops.length > 1000) throw new HttpError(400, 'ops must be an array of at most 1000')
+      const { results, events } = store.applyOps(me, ops)
+      for (const e of events) send(project, e)
+      return reply(res, 200, { results })
+    }
+    if (rest === '/blobs/missing' && req.method === 'POST') {
+      const { hashes } = await json(req)
+      if (!Array.isArray(hashes)) throw new HttpError(400, 'hashes must be an array')
+      return reply(res, 200, { missing: hashes.filter(h => typeof h === 'string' && HASH_RE.test(h) && !store.hasBlob(project, h)) })
+    }
+    const blob = rest.match(/^\/blobs\/([0-9a-f]{64})$/)?.[1]
+    if (blob && req.method === 'PUT') {
+      const bytes = await body(req, MAX_FILE)
+      if (sha256(bytes) !== blob) throw new HttpError(400, 'content does not match its hash')
+      store.putBlob(project, bytes)
+      return reply(res, 204)
+    }
+    if (blob && req.method === 'GET') {
+      if (!store.hasBlob(project, blob)) throw new HttpError(404, 'no such blob')
+      res.writeHead(200, { 'content-type': 'application/octet-stream' })
+      return void createReadStream(store.blobPath(project, blob)).pipe(res)
+    }
+    if (rest === '/conflicts' && req.method === 'GET') return reply(res, 200, { conflicts: store.conflicts(project, url.searchParams.has('all')) })
+    const c = rest.match(/^\/conflicts\/([\w-]{1,64})(?:\/(vote|resolve))?$/)
+    if (c && !c[2] && req.method === 'GET') {
+      const conflict = store.conflict(project, c[1])
+      if (!conflict) throw new HttpError(404, 'no such conflict')
+      return reply(res, 200, conflict)
+    }
+    if (c?.[2] === 'vote' && req.method === 'POST') {
+      const { choice } = await json(req)
+      if (choice !== 'A' && choice !== 'B') throw new HttpError(400, 'choice must be A or B')
+      const conflict = store.vote(me, c[1], choice)
+      send(project, { type: 'conflict', conflict })
+      return reply(res, 200, conflict)
+    }
+    if (c?.[2] === 'resolve' && req.method === 'POST') {
+      const b = await json(req)
+      if (b.choice !== undefined && b.choice !== 'A' && b.choice !== 'B') throw new HttpError(400, 'choice must be A or B')
+      if (b.hash !== undefined && b.hash !== null && !HASH_RE.test(b.hash)) throw new HttpError(400, 'bad hash')
+      const r = store.resolve(me, c[1], b)
+      send(project, { type: 'change', head: r.head })
+      send(project, { type: 'conflict', conflict: r.conflict })
+      return reply(res, 200, r)
+    }
+    if (rest === '/heads' && req.method === 'GET') return reply(res, 200, { heads: store.heads(project) })
+    if (rest === '/history' && req.method === 'GET') return reply(res, 200, { versions: store.history(project, url.searchParams.get('path') ?? '') })
+    if (rest === '/members' && req.method === 'GET') return reply(res, 200, { members: members(project) })
+    throw new HttpError(404, 'not found')
+  }
+
+  const wss = new WebSocketServer({ noServer: true })
+  http.on('upgrade', (req, socket, head) => {
+    const url = new URL(req.url ?? '/', 'http://x')
+    const project = url.pathname.match(/^\/api\/p\/([\w-]{1,64})\/ws$/)?.[1]
+    const me = project ? store.auth(project, url.searchParams.get('token')) : undefined
+    if (!me) return void socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
+    wss.handleUpgrade(req, socket, head, ws => {
+      const room = rooms.get(me.project) ?? new Map()
+      rooms.set(me.project, room)
+      room.set(ws, { me, alive: true })
+      // Same tick as joining the room: nothing committed in between can be missed.
+      const since = Number(url.searchParams.get('since')) || 0
+      const hello: ServerMsg = { type: 'hello', seq: store.seq(me.project), heads: store.heads(me.project, since), conflicts: store.conflicts(me.project), members: members(me.project) }
+      ws.send(JSON.stringify(hello))
+      send(me.project, { type: 'members', members: members(me.project) })
+      ws.on('pong', () => {
+        const s = room.get(ws)
+        if (s) s.alive = true
+      })
+      ws.on('close', () => {
+        room.delete(ws)
+        if (!closing) send(me.project, { type: 'members', members: members(me.project) })
+      })
+    })
+  })
+
+  // Protocol pings find dead clients; the JSON ping lets clients notice a dead server.
+  const beat = setInterval(() => {
+    for (const room of rooms.values())
+      for (const [ws, s] of room) {
+        if (!s.alive) {
+          ws.terminate()
+          continue
+        }
+        s.alive = false
+        ws.ping()
+        ws.send('{"type":"ping"}')
+      }
+  }, 20_000)
+
+  try {
+    await new Promise<void>((ok, fail) => http.once('error', fail).listen(port, ok))
+  } catch (e) {
+    clearInterval(beat)
+    store.db.close()
+    throw e // e.g. EADDRINUSE: the caller decides whether that's fine
+  }
+  const actual = (http.address() as AddressInfo).port
+  return {
+    url: `http://localhost:${actual}`,
+    port: actual,
+    store,
+    async close() {
+      closing = true
+      clearInterval(beat)
+      for (const room of rooms.values()) for (const ws of room.keys()) ws.terminate()
+      wss.close()
+      http.closeAllConnections()
+      await new Promise(r => http.close(r))
+      store.db.close()
+    },
+  }
+}
+
+const APP = fileURLToPath(new URL('..', import.meta.url))
+
+// Plain sh: installs into ~/.synchack-app (outside node_modules, so Node runs the TypeScript as is)
+// and adds `synchack` and `/synchack` to ~/.zshrc. Running it again updates.
+const installScript = (src: string) => `#!/bin/sh
+set -e
+if ! command -v node >/dev/null 2>&1; then
+  echo "synchack needs Node 24 or newer: install it from https://nodejs.org, then run this again."; exit 1
+fi
+if [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 24 ]; then
+  echo "synchack needs Node 24 or newer (you have $(node -v)): update it from https://nodejs.org"; exit 1
+fi
+APP="$HOME/.synchack-app"
+echo "Downloading synchack from ${src} ..."
+rm -rf "$APP" && mkdir -p "$APP"
+curl -fsSL "${src}/install.tgz" | tar -xz -C "$APP"
+(cd "$APP" && npm install --omit=dev --no-audit --no-fund --no-update-notifier --loglevel=error)
+if ! grep -q 'synchack-app' "$HOME/.zshrc" 2>/dev/null; then
+  printf '\n# SyncHack\nsynchack() { node "$HOME/.synchack-app/client-core/cli.ts" "$@" }\n/synchack() { synchack "$@" }\n' >> "$HOME/.zshrc"
+fi
+echo "Done. Open a new Terminal window and type: /synchack"
+`
+
+function reply(res: ServerResponse, status: number, body?: unknown) {
+  res.writeHead(status, body === undefined ? {} : { 'content-type': 'application/json' })
+  res.end(body === undefined ? undefined : JSON.stringify(body))
+}
+
+async function body(req: IncomingMessage, limit: number) {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req as AsyncIterable<Buffer>) {
+    size += chunk.length
+    if (size > limit) throw new HttpError(413, 'too large')
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
+
+async function json(req: IncomingMessage) {
+  const v = JSON.parse((await body(req, 16 * 1024 * 1024)).toString() || '{}')
+  if (!v || typeof v !== 'object') throw new HttpError(400, 'expected a JSON object')
+  return v as Record<string, any>
+}
+
+function text(v: unknown, field: string) {
+  if (typeof v !== 'string' || !v.trim() || v.length > 200) throw new HttpError(400, `${field} must be a short string`)
+  return v.trim()
+}
+
+const who = (b: Record<string, unknown>) => ({ device: text(b.device, 'device'), name: text(b.user, 'user'), deviceName: text(b.deviceName, 'deviceName') })
+
+if (import.meta.main) {
+  const s = await startServer({ port: Number(process.env.PORT ?? 8787), dataDir: process.env.DATA_DIR ?? 'data' })
+  const lan = lanAddresses().map(ip => `http://${ip}:${s.port}`)
+  console.log(`synchack server listening on port ${s.port}, all interfaces (data in ${process.env.DATA_DIR ?? 'data'})`)
+  console.log(lan.length ? `teammates connect with:  --server ${lan.join('   or   ')}` : 'no network address: only this Mac can connect')
+}

@@ -23,8 +23,18 @@ export interface Server {
   close(): Promise<void>
 }
 
-export async function startServer({ port = 8787, dataDir = 'data' } = {}): Promise<Server> {
+export interface ServerOptions {
+  port?: number
+  dataDir?: string
+  /** Only this machine may create projects: true when a creator's Mac hosts (the Hub). */
+  localCreateOnly?: boolean
+  /** Join and create attempts allowed per address per window. Loopback is exempt unless `limitLoopback`. */
+  rateLimit?: { max: number; windowMs: number; limitLoopback?: boolean }
+}
+
+export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 } }: ServerOptions = {}): Promise<Server> {
   const store = new Store(dataDir)
+  const limiter = new RateLimit(rateLimit.max, rateLimit.windowMs)
   const rooms = new Map<string, Map<WebSocket, { me: Device; alive: boolean }>>()
   let closing = false
 
@@ -58,21 +68,28 @@ export async function startServer({ port = 8787, dataDir = 'data' } = {}): Promi
       const tar = spawn('tar', ['-cz', '-C', APP, 'package.json', 'package-lock.json', 'shared', 'server', 'client-core'], { stdio: ['ignore', 'pipe', 'ignore'] })
       return void tar.stdout.pipe(res)
     }
-    if (key === 'POST /api/projects') {
+    if (key === 'POST /api/projects' || key === 'POST /api/join') {
+      const ip = req.socket.remoteAddress ?? ''
+      const local = isLoopback(ip)
+      if (key === 'POST /api/projects' && localCreateOnly && !local) throw new HttpError(403, 'projects can only be created on the Mac that hosts them')
+      if (!(local && !rateLimit.limitLoopback)) {
+        const wait = limiter.take(ip)
+        if (wait) {
+          res.setHeader('retry-after', String(Math.ceil(wait / 1000)))
+          throw new HttpError(429, `too many attempts; try again in ${Math.ceil(wait / 60_000)} min`)
+        }
+      }
       const b = await json(req)
-      return reply(res, 200, store.createProject(text(b.name, 'name'), who(b)))
-    }
-    if (key === 'POST /api/join') {
-      const b = await json(req)
-      const r = store.join(text(b.code, 'code'), who(b))
-      if (!r) throw new HttpError(404, 'unknown join code')
+      if (key === 'POST /api/projects') return reply(res, 200, store.createProject(text(b.name, 'name'), who(b)))
+      const r = store.join(text(b.code, 'code'), who(b), bearer(req))
+      if (!r) throw new HttpError(404, 'unknown or expired invite')
       return reply(res, 200, r)
     }
 
     const m = url.pathname.match(/^\/api\/p\/([\w-]{1,64})(\/.*)$/)
     if (!m) throw new HttpError(404, 'not found')
     const [, project, rest] = m
-    const me = store.auth(project, req.headers.authorization?.replace(/^Bearer /, '') ?? null)
+    const me = store.auth(project, bearer(req))
     if (!me) throw new HttpError(401, 'not a member of this project')
 
     if (rest === '/ops' && req.method === 'POST') {
@@ -125,6 +142,18 @@ export async function startServer({ port = 8787, dataDir = 'data' } = {}): Promi
     if (rest === '/heads' && req.method === 'GET') return reply(res, 200, { heads: store.heads(project) })
     if (rest === '/history' && req.method === 'GET') return reply(res, 200, { versions: store.history(project, url.searchParams.get('path') ?? '') })
     if (rest === '/members' && req.method === 'GET') return reply(res, 200, { members: members(project) })
+    if (rest === '/invite' && req.method === 'POST') {
+      const { rotate } = await json(req)
+      return reply(res, 200, store.invite(project, rotate === true))
+    }
+    const gone = rest.match(/^\/members\/([^/]{1,200})$/)?.[1]
+    if (gone && req.method === 'DELETE') {
+      const device = decodeURIComponent(gone)
+      const invite = store.removeMember(me, device)
+      for (const [ws, s] of rooms.get(project) ?? []) if (s.me.device === device) ws.close(4001, 'removed from the project')
+      send(project, { type: 'members', members: members(project) })
+      return reply(res, 200, { invite })
+    }
     throw new HttpError(404, 'not found')
   }
 
@@ -214,6 +243,30 @@ if ! grep -q 'synchack-app' "$HOME/.zshrc" 2>/dev/null; then
 fi
 echo "Done. Open a new Terminal window and type: /synchack"
 `
+
+const bearer = (req: IncomingMessage) => req.headers.authorization?.match(/^Bearer (.+)$/)?.[1] ?? null
+const isLoopback = (ip: string) => ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
+
+/** Fixed window per address. take() returns 0 when allowed, else ms until the window resets. */
+class RateLimit {
+  private hits = new Map<string, { n: number; reset: number }>()
+  private max: number
+  private windowMs: number
+  constructor(max: number, windowMs: number) {
+    this.max = max
+    this.windowMs = windowMs
+  }
+  take(key: string) {
+    const now = Date.now()
+    if (this.hits.size > 10_000) for (const [k, v] of this.hits) if (v.reset <= now) this.hits.delete(k)
+    const h = this.hits.get(key)
+    if (!h || h.reset <= now) {
+      this.hits.set(key, { n: 1, reset: now + this.windowMs })
+      return 0
+    }
+    return ++h.n > this.max ? h.reset - now : 0
+  }
+}
 
 function reply(res: ServerResponse, status: number, body?: unknown) {
   res.writeHead(status, body === undefined ? {} : { 'content-type': 'application/json' })

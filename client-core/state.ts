@@ -88,6 +88,15 @@ export class LocalState {
     this.run('update projects set mode = ? where id = ?', mode, id)
   }
 
+  removeProject(id: string) {
+    this.run('delete from files where project = ?', id)
+    this.run('delete from projects where id = ?', id)
+  }
+
+  setCode(id: string, code: string) {
+    this.run('update projects set code = ? where id = ?', code, id)
+  }
+
   setSeq(id: string, seq: number) {
     this.run('update projects set seq = ? where id = ?', seq, id)
   }

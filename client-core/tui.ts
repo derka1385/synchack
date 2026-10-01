@@ -7,7 +7,7 @@ import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { lanAddresses, type Conflict } from '../shared/protocol.ts'
 import { call } from './engine.ts'
-import { conflictText, inviteFor, keepLocal, type Hub } from './hub.ts'
+import { conflictText, inviteFor, keepLocal, refreshInvite, type Hub } from './hub.ts'
 import type { Project } from './state.ts'
 
 const h = React.createElement
@@ -122,10 +122,13 @@ export function App({ hub }: { hub: Hub }) {
       })
     if (!p || !sync) return
     if (input === 'l' || input === 'c' || input === 'p') return sync.setMode(input === 'l' ? 'live' : input === 'c' ? 'calm' : 'paused')
-    if (input === 'i') {
-      copy(inviteFor(p))
-      return setFlash({ text: `Invite copied to the clipboard: ${inviteFor(p)}` })
-    }
+    if (input === 'i')
+      return void act(
+        refreshInvite(hub.state, p).then(invite => {
+          copy(invite)
+          return `Invite copied to the clipboard: ${invite} (works for 48 h)`
+        }),
+      )
     if (input === 'o') return void spawn('open', [p.root], { stdio: 'ignore', detached: true }).unref()
     if (input === 'x' && conflicts.length) {
       setCsel(0)

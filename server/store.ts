@@ -29,6 +29,9 @@ const SCHEMA = `
   create index if not exists conflicts_by_path on conflicts (project, path, status);
 `
 
+/** Invites stop working this long after they were made; members are unaffected. */
+export const INVITE_TTL = 48 * 60 * 60 * 1000
+
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' // no 0/O or 1/I/L
 export const randomId = (bytes = 16) => randomBytes(bytes).toString('base64url')
 const label = (m: Device) => `${m.name} (${m.deviceName})`
@@ -42,6 +45,10 @@ export class Store {
     mkdirSync(join(dir, 'blobs'), { recursive: true })
     this.db = new DatabaseSync(join(dir, 'server.db'))
     this.db.exec(SCHEMA)
+    // Columns added after the first release: older server.db files get them here.
+    const cols = new Set(this.all<{ name: string }>('pragma table_info(projects)').map(c => c.name))
+    if (!cols.has('owner')) this.db.exec('alter table projects add column owner text')
+    if (!cols.has('code_expires')) this.db.exec(`alter table projects add column code_expires integer not null default ${Date.now() + INVITE_TTL}`)
   }
 
   private one<T>(sql: string, ...args: SQLInputValue[]) {
@@ -72,18 +79,57 @@ export class Store {
 
   createProject(name: string, who: Omit<Device, 'project'>) {
     const id = randomId() // never shown to users; the join code is a separate secret
-    let code: string
-    do code = Array.from({ length: 6 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join('').replace(/^(...)/, '$1-')
-    while (this.one('select 1 from projects where code = ?', code))
-    this.run('insert into projects (id, code, name, created) values (?, ?, ?, ?)', id, code, name, Date.now())
+    const code = this.newCode()
+    this.run('insert into projects (id, code, name, created, owner, code_expires) values (?, ?, ?, ?, ?, ?)', id, code, name, Date.now(), who.device, Date.now() + INVITE_TTL)
     return { projectId: id, name, code, token: this.addMember({ ...who, project: id }) }
   }
 
-  // ponytail: no rate limit on guesses; 31^6 codes are plenty for a hackathon, add one before going public
-  join(code: string, who: Omit<Device, 'project'>) {
+  private newCode() {
+    let code: string
+    do code = Array.from({ length: 6 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join('').replace(/^(...)/, '$1-')
+    while (this.one('select 1 from projects where code = ?', code))
+    return code
+  }
+
+  /**
+   * Guessing is slowed by the server's per-address rate limit; codes also expire. A device that
+   * is already a member must prove it with its current token, so nobody can take over a
+   * teammate's identity by joining with their (visible) device id.
+   */
+  join(code: string, who: Omit<Device, 'project'>, token: string | null = null) {
     const clean = code.toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^(...)/, '$1-')
-    const p = this.one<{ id: string; name: string; code: string }>('select id, name, code from projects where code = ?', clean)
-    return p && { projectId: p.id, name: p.name, code: p.code, token: this.addMember({ ...who, project: p.id }) }
+    const p = this.one<{ id: string; name: string; code: string }>('select id, name, code from projects where code = ? and code_expires > ?', clean, Date.now())
+    if (!p) return undefined
+    const known = this.one<{ token: string }>('select token from members where project = ? and device = ?', p.id, who.device)
+    if (known && (!token || sha256(token) !== known.token))
+      throw Object.assign(new Error('this device has already joined this project'), { status: 409 })
+    return { projectId: p.id, name: p.name, code: p.code, token: this.addMember({ ...who, project: p.id }) }
+  }
+
+  /** The current invite code, replaced by a new one when asked or when it has expired. */
+  invite(project: string, rotate = false) {
+    const p = this.one<{ code: string; expires: number }>('select code, code_expires as expires from projects where id = ?', project)!
+    if (!rotate && p.expires > Date.now()) return p
+    const fresh = { code: this.newCode(), expires: Date.now() + INVITE_TTL }
+    this.run('update projects set code = ?, code_expires = ? where id = ?', fresh.code, fresh.expires, project)
+    return fresh
+  }
+
+  owner(project: string) {
+    return this.one<{ owner: string | null }>('select owner from projects where id = ?', project)?.owner ?? null
+  }
+
+  /**
+   * The project's creator can remove anyone; everyone can remove themselves. Removing someone
+   * else also replaces the invite code, so the old invite can't bring them back.
+   */
+  removeMember(m: Device, device: string) {
+    if (device !== m.device && this.owner(m.project) !== m.device)
+      throw Object.assign(new Error('only the project creator can remove teammates'), { status: 403 })
+    if (!this.one('select 1 from members where project = ? and device = ?', m.project, device))
+      throw Object.assign(new Error('no such member'), { status: 404 })
+    this.run('delete from members where project = ? and device = ?', m.project, device)
+    return device === m.device ? undefined : this.invite(m.project, true)
   }
 
   private addMember(m: Device) {
@@ -105,9 +151,10 @@ export class Store {
   }
 
   members(project: string) {
+    const owner = this.owner(project)
     return this.all<{ device: string; name: string; deviceName: string }>(
       'select device, name, device_name as deviceName from members where project = ? order by joined', project,
-    )
+    ).map(m => ({ ...m, owner: m.device === owner }))
   }
 
   // ── files ───────────────────────────────────────────────────────────────

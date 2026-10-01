@@ -8,7 +8,7 @@ import { parseArgs } from 'node:util'
 import { type Candidate, type Conflict, type Member, type Mode } from '../shared/protocol.ts'
 import { LocalState, type Project } from './state.ts'
 import { call, createProject, joinProject } from './engine.ts'
-import { Hub, alive, conflictText, freeFolder, inviteFor, keepLocal, parseInvite } from './hub.ts'
+import { Hub, alive, conflictText, freeFolder, inviteFor, keepLocal, parseInvite, refreshInvite, removeMember } from './hub.ts'
 import { runTui } from './tui.ts'
 
 const HELP = `synchack: keep one project folder in sync across your team's Macs
@@ -25,6 +25,10 @@ const HELP = `synchack: keep one project folder in sync across your team's Macs
   synchack vote ID A|B [dir]
   synchack resolve ID A|B|mine [dir]    mine = the file as it is on this Mac now (e.g. hand-merged)
   synchack open [dir]                   open the project folder in Finder
+  synchack invite [dir] [--new]         print the invite (works for 48 h); --new replaces it
+  synchack members [dir]                list teammates
+  synchack remove NAME|DEVICE [dir]     remove a teammate (creator only; also replaces the invite)
+  synchack leave [dir]                  stop being a member of the project (files stay)
 
   --server URL   use that server instead of hosting projects on this Mac (or $SYNCHACK_SERVER)
   --user NAME    how teammates see you (remembered)
@@ -34,7 +38,7 @@ const HELP = `synchack: keep one project folder in sync across your team's Macs
 
 const { values: opt, positionals } = parseArgs({
   allowPositionals: true,
-  options: { server: { type: 'string' }, name: { type: 'string' }, user: { type: 'string' }, force: { type: 'boolean' }, help: { type: 'boolean', short: 'h' } },
+  options: { server: { type: 'string' }, name: { type: 'string' }, user: { type: 'string' }, force: { type: 'boolean' }, new: { type: 'boolean' }, help: { type: 'boolean', short: 'h' } },
 })
 const [cmd, ...args] = positionals
 const state = new LocalState(process.env.SYNCHACK_HOME ?? join(homedir(), 'Library', 'Application Support', 'SyncHack'))
@@ -158,6 +162,30 @@ async function main() {
       const p = here(dir)
       const r = choice === 'mine' ? await keepLocal(p, await call(p, 'GET', `/conflicts/${id}`)) : await call(p, 'POST', `/conflicts/${id}/resolve`, { choice })
       return console.log(`Resolved ${r.conflict.path} as v${r.head.version}; every teammate's copy updates now.`)
+    }
+    case 'invite':
+      return console.log(await refreshInvite(state, here(args[0]), opt.new))
+    case 'members': {
+      const { members } = await call(here(args[0]), 'GET', '/members')
+      for (const m of members as Member[])
+        console.log(`${m.name} (${m.deviceName})${m.owner ? ' · creator' : ''}${m.online ? ' · online' : ''}${m.device === state.device ? ' · this Mac' : ''}  ${m.device}`)
+      return
+    }
+    case 'remove': {
+      const [who, dir] = args
+      if (!who) die('usage: synchack remove NAME|DEVICE [dir]   (see: synchack members)')
+      const p = here(dir)
+      const { members } = await call(p, 'GET', '/members')
+      const hits = (members as Member[]).filter(m => m.device === who || m.name.toLowerCase() === who.toLowerCase())
+      if (hits.length !== 1) die(hits.length ? `${who} matches ${hits.length} devices; use the device id from: synchack members` : `no teammate called ${who} (see: synchack members)`)
+      if (hits[0].device === state.device) die('that is this Mac; use: synchack leave')
+      await removeMember(state, p, hits[0].device)
+      return console.log(`Removed ${hits[0].name} (${hits[0].deviceName}). New invite: ${inviteFor(p)}`)
+    }
+    case 'leave': {
+      const p = here(args[0])
+      await removeMember(state, p, state.device)
+      return console.log(`Left "${p.name}". The files in ${p.root} stay; they no longer sync.`)
     }
     case 'open':
       return void spawn('open', [here(args[0]).root], { stdio: 'ignore', detached: true }).unref()

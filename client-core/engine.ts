@@ -85,6 +85,7 @@ export interface SyncOptions {
   reconnectMaxMs?: number
 }
 
+const REMOVED = 4001 // WebSocket close code: this device was removed from the project
 const BATCH_FILES = 500
 const BATCH_BYTES = 32 * 1024 * 1024
 
@@ -530,14 +531,20 @@ export class ProjectSync extends EventEmitter {
       }
       this.enqueue(() => this.receive(ws, msg))
     }
-    ws.onclose = () => this.drop(ws)
+    ws.onclose = e => this.drop(ws, e.code)
     ws.onerror = () => {} // onclose follows
   }
 
-  private drop(ws: WebSocket) {
+  private drop(ws: WebSocket, code?: number) {
     if (this.ws !== ws) return
     this.ws = undefined
     ws.close()
+    if (code === REMOVED) {
+      this.online = false
+      this.errors.set('', 'no longer a member of this project; not syncing')
+      this.log('no longer a member of this project; stopped syncing')
+      return void this.emit('status')
+    }
     if (this.online && !this.stopped && this.mode !== 'paused') this.log('offline; changes stay local until the server is back')
     this.online = false
     this.emit('status')

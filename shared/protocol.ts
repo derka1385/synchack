@@ -62,6 +62,7 @@ export interface Member {
   name: string
   deviceName: string
   online: boolean
+  owner?: boolean // created the project: can remove teammates
 }
 
 export type ServerMsg =

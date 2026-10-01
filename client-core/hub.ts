@@ -51,6 +51,27 @@ export async function conflictText(p: Project, c: Conflict) {
   }
 }
 
+/**
+ * The project's current invite. Invites expire, so this asks the server (which replaces an
+ * expired code, or any code when `rotate`) and remembers the answer here.
+ */
+export async function refreshInvite(state: LocalState, p: Project, rotate = false) {
+  const { code } = await call(p, 'POST', '/invite', { rotate })
+  state.setCode(p.id, code)
+  p.code = code
+  return inviteFor(p)
+}
+
+/** Removes a teammate (creator only) or this device. Removing someone also replaces the invite. */
+export async function removeMember(state: LocalState, p: Project, device: string) {
+  const { invite } = await call(p, 'DELETE', `/members/${encodeURIComponent(device)}`)
+  if (device === state.device) state.removeProject(p.id)
+  else if (invite) {
+    state.setCode(p.id, invite.code)
+    p.code = invite.code
+  }
+}
+
 /** Resolves a conflict with the file as it is on this Mac now (e.g. merged by hand). */
 export async function keepLocal(p: Project, c: Conflict) {
   const file = join(p.root, c.path)
@@ -109,7 +130,7 @@ export class Hub extends EventEmitter {
 
   private async host(port: number) {
     try {
-      this.hosting = await startServer({ port, dataDir: join(this.state.home, 'server') })
+      this.hosting = await startServer({ port, dataDir: join(this.state.home, 'server'), localCreateOnly: true })
       this.serverUrl = this.hosting.url
     } catch {
       // Port taken: fine if it is already a synchack server (e.g. `npm run server`).
@@ -120,7 +141,14 @@ export class Hub extends EventEmitter {
   }
 
   private tick() {
-    for (const p of this.state.projects()) {
+    const projects = this.state.projects()
+    for (const [id, sync] of this.engines) // left with `synchack leave`
+      if (!projects.some(p => p.id === id)) {
+        this.engines.delete(id)
+        void sync.stop()
+        this.emit('update')
+      }
+    for (const p of projects) {
       const sync = this.engines.get(p.id)
       if (sync) {
         if (p.mode !== sync.mode) sync.setMode(p.mode)

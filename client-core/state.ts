@@ -15,6 +15,7 @@ export interface Project {
   code: string
   mode: Mode
   seq: number // last server commit applied here
+  cert: string | null // the host's self-signed certificate (PEM), pinned; null for plain HTTP or a CA-signed server
 }
 
 /** The server content a local file was last in sync with. */
@@ -39,6 +40,8 @@ export class LocalState {
         token text not null, code text not null, mode text not null default 'live', seq integer not null default 0, status text);
       create table if not exists files (project text not null, path text not null, version integer not null, hash text, primary key (project, path));
     `)
+    const cols = this.db.prepare('pragma table_info(projects)').all().map(c => c.name)
+    if (!cols.includes('cert')) this.db.exec('alter table projects add column cert text')
   }
 
   private one<T>(sql: string, ...args: SQLInputValue[]) {
@@ -68,11 +71,11 @@ export class LocalState {
   }
 
   projects() {
-    return this.db.prepare('select id, name, root, server, token, code, mode, seq from projects order by name').all() as unknown as Project[]
+    return this.db.prepare('select id, name, root, server, token, code, mode, seq, cert from projects order by name').all() as unknown as Project[]
   }
 
   project(id: string) {
-    return this.one<Project>('select id, name, root, server, token, code, mode, seq from projects where id = ?', id)
+    return this.one<Project>('select id, name, root, server, token, code, mode, seq, cert from projects where id = ?', id)
   }
 
   /** The project whose folder contains `dir`. */
@@ -81,7 +84,7 @@ export class LocalState {
   }
 
   addProject(p: Project) {
-    this.run('insert into projects (id, name, root, server, token, code, mode, seq) values (?, ?, ?, ?, ?, ?, ?, ?)', p.id, p.name, p.root, p.server, p.token, p.code, p.mode, p.seq)
+    this.run('insert into projects (id, name, root, server, token, code, mode, seq, cert) values (?, ?, ?, ?, ?, ?, ?, ?, ?)', p.id, p.name, p.root, p.server, p.token, p.code, p.mode, p.seq, p.cert)
   }
 
   setMode(id: string, mode: Mode) {

@@ -1,6 +1,8 @@
 // HTTP for commands and blobs, one WebSocket per client for pushed events.
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { createReadStream, rmSync } from 'node:fs'
+import { createServer as createTlsServer } from 'node:https'
+import { createHash as hashOf, X509Certificate } from 'node:crypto'
+import { createReadStream, readFileSync, rmSync } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { pipeline } from 'node:stream/promises'
 import { createHash } from 'node:crypto'
@@ -22,6 +24,9 @@ class HttpError extends Error {
 export interface Server {
   url: string
   port: number
+  /** With TLS: the certificate (PEM) and the sha256 of its public key that clients pin. */
+  cert?: string
+  pin?: string
   store: Store
   close(): Promise<void>
 }
@@ -37,12 +42,15 @@ export interface ServerOptions {
   quota?: number
   /** One line per request and every server error. Default: silent. */
   log?: (line: string) => void
+  /** Serve HTTPS with this key and certificate (PEM). */
+  tls?: { key: string; cert: string }
 }
 
 const MAX_UPLOADS = 16 // blob uploads in flight at once, across all clients
 const MAX_JSON = 2 * 1024 * 1024 // 1000 ops is about 300 KB
 
-export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 }, quota, log = () => {} }: ServerOptions = {}): Promise<Server> {
+export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 }, quota, log = () => {}, tls }: ServerOptions = {}): Promise<Server> {
+  const pin = tls && hashOf('sha256').update(new X509Certificate(tls.cert).publicKey.export({ type: 'spki', format: 'der' })).digest('base64')
   const store = new Store(dataDir, { quota })
   let uploads = 0
   const limiter = new RateLimit(rateLimit.max, rateLimit.windowMs)
@@ -59,7 +67,7 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
   }
 
   const caller = new WeakMap<IncomingMessage, Device>()
-  const http = createServer((req, res) => {
+  const handle = (req: IncomingMessage, res: ServerResponse) => {
     const start = Date.now()
     res.on('close', () => {
       const me = caller.get(req)
@@ -72,7 +80,8 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
       if (res.headersSent) return res.destroy()
       reply(res, status, { error: status >= 500 && !e.status ? 'internal server error' : e.message })
     })
-  })
+  }
+  const http = tls ? createTlsServer({ key: tls.key, cert: tls.cert }, handle) : createServer(handle)
 
   async function route(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://x')
@@ -81,7 +90,8 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     // Teammates install synchack from this Mac: curl -fsSL http://<ip>:8787/install | sh
     if (key === 'GET /install') {
       res.writeHead(200, { 'content-type': 'text/x-shellscript' })
-      return void res.end(installScript(`http://${req.headers.host}`))
+      const host = /^[\w.:[\]-]{1,255}$/.test(req.headers.host ?? '') ? req.headers.host : `localhost:${actual}`
+      return void res.end(installScript(`${tls ? 'https' : 'http'}://${host}`, pin))
     }
     if (key === 'GET /install.tgz') {
       res.writeHead(200, { 'content-type': 'application/gzip' })
@@ -259,6 +269,7 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
       }
   }, 20_000)
 
+  let actual = port
   try {
     await new Promise<void>((ok, fail) => http.once('error', fail).listen(port, ok))
   } catch (e) {
@@ -266,10 +277,12 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     store.db.close()
     throw e // e.g. EADDRINUSE: the caller decides whether that's fine
   }
-  const actual = (http.address() as AddressInfo).port
+  actual = (http.address() as AddressInfo).port
   return {
-    url: `http://localhost:${actual}`,
+    url: `${tls ? 'https' : 'http'}://localhost:${actual}`,
     port: actual,
+    cert: tls?.cert,
+    pin,
     store,
     async close() {
       closing = true
@@ -287,7 +300,7 @@ const APP = fileURLToPath(new URL('..', import.meta.url))
 
 // Plain sh: installs into ~/.synchack-app (outside node_modules, so Node runs the TypeScript as is)
 // and adds `synchack` and `/synchack` to ~/.zshrc. Running it again updates.
-const installScript = (src: string) => `#!/bin/sh
+const installScript = (src: string, pin?: string) => `#!/bin/sh
 set -e
 if ! command -v node >/dev/null 2>&1; then
   echo "synchack needs Node 24 or newer: install it from https://nodejs.org, then run this again."; exit 1
@@ -298,7 +311,7 @@ fi
 APP="$HOME/.synchack-app"
 echo "Downloading synchack from ${src} ..."
 rm -rf "$APP" && mkdir -p "$APP"
-curl -fsSL "${src}/install.tgz" | tar -xz -C "$APP"
+curl -fsSL ${pin ? `-k --pinnedpubkey 'sha256//${pin}' ` : ''}"${src}/install.tgz" | tar -xz -C "$APP"
 (cd "$APP" && npm install --omit=dev --no-audit --no-fund --no-update-notifier --loglevel=error)
 if ! grep -q 'synchack-app' "$HOME/.zshrc" 2>/dev/null; then
   printf '\n# SyncHack\nsynchack() { node "$HOME/.synchack-app/client-core/cli.ts" "$@" }\n/synchack() { synchack "$@" }\n' >> "$HOME/.zshrc"
@@ -370,6 +383,8 @@ if (import.meta.main) {
     dataDir: process.env.DATA_DIR ?? 'data',
     quota: process.env.SYNCHACK_QUOTA_GB ? Number(process.env.SYNCHACK_QUOTA_GB) * 1024 ** 3 : undefined,
     log: line => console.log(stamp(line)),
+    // A certificate from a real CA (or your proxy's) keeps clients on their system trust store.
+    tls: process.env.TLS_CERT && process.env.TLS_KEY ? { cert: readFileSync(process.env.TLS_CERT, 'utf8'), key: readFileSync(process.env.TLS_KEY, 'utf8') } : undefined,
   })
   let stopping = false
   const stop = (why: string, code = 0) => {
@@ -386,7 +401,7 @@ if (import.meta.main) {
     console.error(stamp(`uncaught: ${e.stack ?? e}`))
     stop('uncaught exception', 1)
   })
-  const lan = lanAddresses().map(ip => `http://${ip}:${s.port}`)
+  const lan = lanAddresses().map(ip => `${s.cert ? 'https' : 'http'}://${ip}:${s.port}`)
   console.log(`synchack server listening on port ${s.port}, all interfaces (data in ${process.env.DATA_DIR ?? 'data'})`)
   console.log(lan.length ? `teammates connect with:  --server ${lan.join('   or   ')}` : 'no network address: only this Mac can connect')
 }

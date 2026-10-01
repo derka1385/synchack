@@ -10,12 +10,13 @@ import { LocalState, type Project } from './state.ts'
 import { call, createProject, joinProject } from './engine.ts'
 import { Hub, alive, conflictText, freeFolder, inviteFor, keepLocal, parseInvite, refreshInvite, removeMember } from './hub.ts'
 import { runTui } from './tui.ts'
+import { hostIdentity } from './net.ts'
 
 const HELP = `synchack: keep one project folder in sync across your team's Macs
 
   synchack                              open the terminal interface (share, join, see who edits what)
   synchack create [dir] [--name NAME]   share a folder (existing files are imported) and print the invite
-  synchack join INVITE [dir]            join with an invite like HX7-K92@192.168.1.129:8787
+  synchack join INVITE [dir]            join with an invite like HX7-K92@192.168.1.129:8787#k3Jq…
                                         (the folder defaults to ~/<project name>)
   synchack run                          keep every project on this Mac in sync, without the interface
   synchack status                       projects, sync state, teammates, open conflicts
@@ -95,7 +96,8 @@ async function main() {
       const pid = daemonPid()
       if (!pid) return foreground(async hub => shared(await hub.create(dir, opt.name)))
       // A running synchack hosts on this Mac; it picks the new project up within a second.
-      shared(await createProject(state, explicitServer ?? 'http://localhost:8787', dir, opt.name))
+      const cert = explicitServer ? null : (hostIdentity(join(state.home, 'tls'))?.cert ?? null)
+      shared(await createProject(state, explicitServer ?? `${cert ? 'https' : 'http'}://localhost:${port ?? 8787}`, dir, opt.name, cert))
       return console.log(`The running synchack (pid ${pid}) syncs it.`)
     }
     case 'join': {
@@ -106,8 +108,8 @@ async function main() {
         die(`${dir} is not empty. Join into an empty folder, or pass --force (files that differ become conflicts).`)
       const pid = daemonPid()
       if (!pid) return foreground(async hub => console.log(`Joined "${(await hub.join(invite, dir)).name}"`))
-      const { code, server } = parseInvite(invite)
-      const p = await joinProject(state, server, code, name => dir ?? freeFolder(name))
+      const { code, server, pin } = parseInvite(invite)
+      const p = await joinProject(state, server, code, name => dir ?? freeFolder(name), pin)
       return console.log(`Joined "${p.name}" into ${p.root}; the running synchack (pid ${pid}) syncs it.`)
     }
     case 'run':

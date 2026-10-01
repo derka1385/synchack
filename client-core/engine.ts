@@ -16,40 +16,44 @@ import { randomBytes } from 'node:crypto'
 import { MAX_FILE, sha256, type Conflict, type Hash, type Head, type Member, type Mode, type Op, type OpResult, type ServerMsg } from '../shared/protocol.ts'
 import { cleanPath, ignoreRules, type Ignore } from '../shared/paths.ts'
 import type { LocalState, Project } from './state.ts'
+import { WebSocket, type ClientOptions } from 'ws'
+import { ConnectError, pinnedCert, request, trust, type Peer } from './net.ts'
 
 /** Server unreachable or failing: retried later, never mistaken for a local file problem. */
 export class NetError extends Error {}
 
-type Target = Pick<Project, 'server' | 'id' | 'token'>
+type Target = Pick<Project, 'server' | 'id' | 'token' | 'cert'>
 
 /** Authenticated call to a project's API. JSON in and out; Uint8Array bodies go raw. */
 export async function call(p: Target, method: string, path: string, body?: unknown): Promise<any> {
   const raw = body instanceof Uint8Array
-  let res: Response
+  let res
   try {
-    res = await fetch(`${p.server}/api/p/${p.id}${path}`, {
-      method,
+    res = await request(p, method, `/api/p/${p.id}${path}`, {
       headers: { authorization: `Bearer ${p.token}`, ...(body !== undefined && !raw ? { 'content-type': 'application/json' } : {}) },
-      body: body === undefined ? undefined : raw ? (body as Uint8Array<ArrayBuffer>) : JSON.stringify(body),
-      signal: AbortSignal.timeout(60_000),
+      body: body === undefined ? undefined : raw ? body : JSON.stringify(body),
     })
   } catch (e) {
     throw new NetError(`${method} ${path}: ${(e as Error).message}`)
   }
-  if (!res.ok) throw new NetError(`${method} ${path}: ${res.status} ${await res.text()}`)
+  if (res.status < 200 || res.status > 299) throw new NetError(`${method} ${path}: ${res.status} ${res.body}`)
   if (res.status === 204) return undefined
-  return res.headers.get('content-type')?.startsWith('application/json') ? res.json() : Buffer.from(await res.arrayBuffer())
+  return res.type.startsWith('application/json') ? JSON.parse(res.body.toString()) : res.body
 }
 
-async function post(server: string, path: string, body: unknown) {
-  let res: Response
+async function post(peer: Peer, path: string, body: unknown, token?: string) {
+  let res
   try {
-    res = await fetch(server + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-  } catch {
-    throw new Error(`can't reach the sync server at ${server}. Is it running, and is --server its address? ("localhost" is the Mac you type it on.)`)
+    res = await request(peer, 'POST', path, { headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body) })
+  } catch (e) {
+    if (!(e instanceof ConnectError)) throw e
+    throw new Error(`can't reach the sync server at ${peer.server} (${e.message}). Is it running, and is --server its address? ("localhost" is the Mac you type it on.)`)
   }
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(data.error ?? `${path}: HTTP ${res.status}`)
+  let data: any = {}
+  try {
+    data = JSON.parse(res.body.toString())
+  } catch {}
+  if (res.status < 200 || res.status > 299) throw new Error(data.error ?? `${path}: HTTP ${res.status}`)
   return data
 }
 
@@ -61,20 +65,27 @@ function claim(state: LocalState, dir: string) {
   return root
 }
 
-/** Registers a new shared project. Existing files in `dir` are imported on the first sync. */
-export async function createProject(state: LocalState, server: string, dir: string, name = basename(dir)) {
+/**
+ * Registers a new shared project. Existing files in `dir` are imported on the first sync.
+ * `cert` is the server's self-signed certificate, when it has one (a Mac hosting itself).
+ */
+export async function createProject(state: LocalState, server: string, dir: string, name = basename(dir), cert: string | null = null) {
   const root = claim(state, dir)
-  const r = await post(server, '/api/projects', { name, ...state.identity() })
-  const p: Project = { id: r.projectId, name: r.name, root, server, token: r.token, code: r.code, mode: 'live', seq: 0 }
+  const r = await post({ server, cert }, '/api/projects', { name, ...state.identity() })
+  const p: Project = { id: r.projectId, name: r.name, root, server, token: r.token, code: r.code, mode: 'live', seq: 0, cert }
   state.addProject(p)
   return p
 }
 
-/** Registers an existing project by join code. `dir` may depend on the project's name. Files arrive on the first sync. */
-export async function joinProject(state: LocalState, server: string, code: string, dir: string | ((name: string) => string)) {
-  const r = await post(server, '/api/join', { code, ...state.identity() })
+/**
+ * Registers an existing project by join code. `dir` may depend on the project's name. Files
+ * arrive on the first sync. With `pin` (from the invite) the server must hold that key.
+ */
+export async function joinProject(state: LocalState, server: string, code: string, dir: string | ((name: string) => string), pin?: string) {
+  const cert = pin ? await pinnedCert(server, pin) : null
+  const r = await post({ server, cert }, '/api/join', { code, ...state.identity() })
   const root = claim(state, typeof dir === 'string' ? dir : dir(r.name))
-  const p: Project = { id: r.projectId, name: r.name, root, server, token: r.token, code: r.code, mode: 'live', seq: 0 }
+  const p: Project = { id: r.projectId, name: r.name, root, server, token: r.token, code: r.code, mode: 'live', seq: 0, cert }
   state.addProject(p)
   return p
 }
@@ -523,7 +534,7 @@ export class ProjectSync extends EventEmitter {
   private connect() {
     if (this.stopped || this.ws || this.mode === 'paused') return
     const url = `${this.p.server.replace(/^http/, 'ws')}/api/p/${this.p.id}/ws?token=${encodeURIComponent(this.p.token)}&since=${this.p.seq}`
-    const ws = new WebSocket(url)
+    const ws = new WebSocket(url, { ...(trust(this.p.cert) as ClientOptions), maxPayload: 256 * 1024 * 1024 })
     this.ws = ws
     this.lastMsg = Date.now()
     ws.onmessage = e => {

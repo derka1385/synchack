@@ -7,7 +7,7 @@ import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { lanAddresses, type Conflict } from '../shared/protocol.ts'
 import { call } from './engine.ts'
-import { conflictText, inviteFor, keepLocal, refreshInvite, type Hub } from './hub.ts'
+import { conflictText, installCommand, inviteFor, keepLocal, refreshInvite, type Hub } from './hub.ts'
 import type { Project } from './state.ts'
 
 const h = React.createElement
@@ -112,7 +112,7 @@ export function App({ hub }: { hub: Hub }) {
       })
     if (input === 'j')
       return setPrompt({
-        label: 'Paste the invite (looks like HX7-K92@192.168.1.129:8787)',
+        label: 'Paste the invite (looks like HX7-K92@192.168.1.129:8787#k3Jq…)',
         value: '',
         run: async v => {
           const np = await hub.join(v)
@@ -137,7 +137,7 @@ export function App({ hub }: { hub: Hub }) {
   })
 
   const me = hub.state.identity()
-  const install = hub.hosting && `curl -fsSL http://${lanAddresses()[0] ?? 'localhost'}:${hub.hosting.port}/install | sh`
+  const install = hub.hosting && installCommand(hub.hosting.port, hub.hosting.cert)
   const where = hub.hosting ? `hosting on ${lanAddresses()[0] ?? 'localhost'}:${hub.hosting.port}` : (hub.hostError ?? `server ${hub.serverUrl}`)
 
   // Everyone on this network running synchack; teammates of the selected project are marked.

@@ -10,24 +10,36 @@ import { lanAddresses, sha256, type Conflict, type Hash } from '../shared/protoc
 import { decode, isText, merge3 } from '../shared/merge.ts'
 import { ProjectSync, call, createProject, joinProject, type SyncOptions } from './engine.ts'
 import type { LocalState, Project } from './state.ts'
+import { hostIdentity, pinOf, request, urlPin } from './net.ts'
 
 export const DEFAULT_PORT = 8787
 const LOOPBACK = ['localhost', '127.0.0.1', '[::1]']
 
-/** "HX7-K92@192.168.1.129:8787": everything a teammate needs, in one paste. */
-export function inviteFor(p: Pick<Project, 'code' | 'server'>) {
+/**
+ * "HX7-K92@192.168.1.129:8787#k3Jq…": everything a teammate needs, in one paste. The part after
+ * `#` is the hash of the host's public key: joining checks it before sending anything.
+ */
+export function inviteFor(p: Pick<Project, 'code' | 'server'> & { cert?: string | null }) {
   const u = new URL(p.server)
-  if (u.protocol === 'https:') return `${p.code}@${u.origin}`
+  if (u.protocol === 'https:' && !p.cert) return `${p.code}@${u.origin}` // a CA-signed server
   const host = LOOPBACK.includes(u.hostname) ? (lanAddresses()[0] ?? u.hostname) : u.hostname
-  return `${p.code}@${host}:${u.port || DEFAULT_PORT}`
+  return `${p.code}@${host}:${u.port || DEFAULT_PORT}${p.cert ? `#${urlPin(pinOf(p.cert))}` : ''}`
 }
 
 export function parseInvite(invite: string) {
-  const m = invite.trim().match(/^([A-Za-z0-9]{3}-?[A-Za-z0-9]{3})@(\S+)$/)
-  if (!m) throw new Error('an invite looks like HX7-K92@192.168.1.129:8787')
+  const m = invite.trim().match(/^([A-Za-z0-9]{3}-?[A-Za-z0-9]{3})@([^\s#]+)(?:#([\w+/=-]{43,44}))?$/)
+  if (!m) throw new Error('an invite looks like HX7-K92@192.168.1.129:8787#k3Jq…')
   const addr = m[2].replace(/\/+$/, '')
-  const server = /^https?:\/\//.test(addr) ? addr : `http://${addr.includes(':') ? addr : `${addr}:${DEFAULT_PORT}`}`
-  return { code: m[1], server }
+  const pin = m[3]
+  const scheme = pin ? 'https' : 'http'
+  const server = /^https?:\/\//.test(addr) ? addr : `${scheme}://${addr.includes(':') ? addr : `${addr}:${DEFAULT_PORT}`}`
+  return { code: m[1], server, pin }
+}
+
+/** The shell command that installs synchack from a hosting Mac, pinned to its key when it has one. */
+export function installCommand(port: number, cert?: string) {
+  const host = lanAddresses()[0] ?? 'localhost'
+  return cert ? `curl -fsSLk --pinnedpubkey sha256//${pinOf(cert)} https://${host}:${port}/install | sh` : `curl -fsSL http://${host}:${port}/install | sh`
 }
 
 /** ~/<project name>, or ~/<name>-2 … when that folder already holds something. */
@@ -111,6 +123,7 @@ export class Hub extends EventEmitter {
   readonly engines = new Map<string, ProjectSync>()
   readonly logs = new Map<string, string[]>()
   serverUrl = '' // where projects created here live
+  serverCert: string | null = null // its self-signed certificate, when this Mac hosts with TLS
   hosting?: Server
   hostError?: string
   private opts: HubOptions
@@ -139,14 +152,22 @@ export class Hub extends EventEmitter {
   }
 
   private async host(port: number) {
+    const tls = hostIdentity(join(this.state.home, 'tls'))
     try {
-      this.hosting = await startServer({ port, dataDir: join(this.state.home, 'server'), localCreateOnly: true, log: serverLog(join(this.state.home, 'server.log')) })
+      this.hosting = await startServer({ port, dataDir: join(this.state.home, 'server'), localCreateOnly: true, log: serverLog(join(this.state.home, 'server.log')), tls })
       this.serverUrl = this.hosting.url
+      this.serverCert = tls?.cert ?? null
     } catch {
-      // Port taken: fine if it is already a synchack server (e.g. `npm run server`).
-      const url = `http://localhost:${port}`
-      if (await fetch(`${url}/health`).then(r => r.ok, () => false)) this.serverUrl = url
-      else this.hostError = `port ${port} is used by another program; can't host projects`
+      // Port taken: fine if it is already a synchack server (e.g. `npm run server`, or another synchack here).
+      for (const peer of [{ server: `https://localhost:${port}`, cert: tls?.cert }, { server: `http://localhost:${port}` }]) {
+        if (peer.server.startsWith('https') && !peer.cert) continue
+        const res = await request(peer, 'GET', '/health', { timeoutMs: 2000 }).catch(() => undefined)
+        if (res?.status !== 200) continue
+        this.serverUrl = peer.server
+        this.serverCert = peer.cert ?? null
+        return
+      }
+      this.hostError = `port ${port} is used by another program; can't host projects`
     }
   }
 
@@ -190,15 +211,15 @@ export class Hub extends EventEmitter {
   /** Shares a folder (existing files are imported) from this Mac. */
   async create(dir: string, name?: string) {
     if (!this.serverUrl) throw new Error(this.hostError ?? 'no server to create projects on')
-    const p = await createProject(this.state, this.serverUrl, dir, name)
+    const p = await createProject(this.state, this.serverUrl, dir, name, this.serverCert)
     this.add(p)
     return p
   }
 
   /** Joins from an invite; the folder is named after the project unless `dir` is given. */
   async join(invite: string, dir?: string) {
-    const { code, server } = parseInvite(invite)
-    const p = await joinProject(this.state, server, code, name => dir ?? freeFolder(name))
+    const { code, server, pin } = parseInvite(invite)
+    const p = await joinProject(this.state, server, code, name => dir ?? freeFolder(name), pin)
     this.add(p)
     return p
   }

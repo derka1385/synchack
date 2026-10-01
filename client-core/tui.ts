@@ -129,6 +129,10 @@ export function App({ hub }: { hub: Hub }) {
           return `Invite copied to the clipboard: ${invite} (works for 48 h)`
         }),
       )
+    if (input === 'u' && hub.hosting) {
+      copy(installCommand(hub.hosting.port, hub.hosting.cert))
+      return setFlash({ text: 'Install command copied: teammates paste it into Terminal' })
+    }
     if (input === 'o') return void spawn('open', [p.root], { stdio: 'ignore', detached: true }).unref()
     if (input === 'x' && conflicts.length) {
       setCsel(0)
@@ -187,14 +191,14 @@ export function App({ hub }: { hub: Hub }) {
           { dimColor: true, wrap: 'truncate' },
           view === 'conflicts'
             ? '↑↓ choose · a keep A · b keep B · m keep my file · 1/2 vote · esc back'
-            : 'n share · j join · ↑↓ project · i invite · l/c/p live/calm/pause · o Finder · x conflicts · q quit',
+            : 'n share · j join · ↑↓ project · i invite · u install cmd · l/c/p live/calm/pause · o Finder · x conflicts · q quit',
         )
 
   return h(
     Box,
     { flexDirection: 'column' },
     h(Box, { paddingX: 1 }, h(Text, { bold: true, color: 'cyan' }, 'synchack'), h(Text, { dimColor: true }, `  ${me.user} · ${me.deviceName} · ${where}`)),
-    install ? h(Box, { paddingX: 1 }, h(Text, { dimColor: true, wrap: 'truncate' }, 'teammates without synchack: '), h(Text, { wrap: 'truncate' }, install)) : null,
+    install ? h(Box, { paddingX: 1 }, h(Text, { wrap: 'truncate' }, h(Text, { dimColor: true }, 'teammates without synchack (u copies it): '), install)) : null,
     h(Box, {}, projectList, p && sync ? (view === 'conflicts' ? conflictPane(p, conflicts, csel, preview, rows) : projectPane(hub, p, rows)) : null),
     h(Box, { paddingX: 1 }, footer),
   )
@@ -215,14 +219,15 @@ function projectPane(hub: Hub, p: Project, rows: number) {
   const conflicts = [...sync.conflicts.values()]
   const errors = [...sync.errors].slice(0, 3)
   const logs = hub.logs.get(p.id) ?? []
-  const room = Math.max(3, rows - 14 - members.length - (conflicts.length ? conflicts.length + 1 : 0) - errors.length)
+  const room = Math.max(3, rows - 15 - members.length - (conflicts.length ? conflicts.length + 1 : 0) - errors.length)
   const status = sync.mode === 'paused' ? h(Text, { color: 'yellow' }, 'paused') : sync.online ? h(Text, { color: 'green' }, `${sync.mode} · online`) : h(Text, { color: 'red' }, `${sync.mode} · offline, retrying`)
 
   return h(
     Box,
     { flexDirection: 'column', borderStyle: 'round', borderColor: 'cyan', flexGrow: 1, paddingX: 1 },
     h(Text, { wrap: 'truncate' }, h(Text, { bold: true }, p.name), '  ', status, h(Text, { dimColor: true }, `  ${tilde(p.root)}`)),
-    h(Text, { wrap: 'truncate' }, h(Text, { dimColor: true }, 'invite  '), h(Text, { bold: true }, inviteFor(p)), h(Text, { dimColor: true }, '  (i copies it)')),
+    // the invite carries a key hash, so it is long: wrap rather than cut it
+    h(Text, { wrap: 'wrap' }, h(Text, { dimColor: true }, 'invite (i copies it)  '), h(Text, { bold: true }, inviteFor(p))),
     h(Text, { bold: true }, '\nTeam'),
     ...members.map(m => {
       const files = working(m.device)

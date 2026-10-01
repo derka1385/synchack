@@ -31,7 +31,8 @@ export interface Op {
 export interface OpResult {
   // ok: applied (or nothing to do) · merged: combined with newer server content
   // conflict: could not merge, both kept · blocked: path has an open conflict
-  status: 'ok' | 'merged' | 'conflict' | 'blocked' | 'error'
+  // busy: the server had no time for this merge now; send the same op again shortly
+  status: 'ok' | 'merged' | 'conflict' | 'blocked' | 'busy' | 'error'
   version: number // server head after the op
   hash: Hash | null
   conflictId?: string
@@ -62,6 +63,7 @@ export interface Member {
   name: string
   deviceName: string
   online: boolean
+  owner?: boolean // created the project: can remove teammates
 }
 
 export type ServerMsg =

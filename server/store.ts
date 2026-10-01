@@ -4,7 +4,7 @@
 
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { randomBytes, randomInt } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { closeSync, cpSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { HASH_RE, sha256, type Conflict, type Hash, type Head, type Op, type OpResult, type ServerMsg } from '../shared/protocol.ts'
 import { cleanPath } from '../shared/paths.ts'
@@ -27,7 +27,19 @@ const SCHEMA = `
   create index if not exists versions_by_op on versions (project, op);
   create table if not exists conflicts (id text primary key, project text not null, path text not null, op text, status text not null, data text not null);
   create index if not exists conflicts_by_path on conflicts (project, path, status);
+  create table if not exists blobs (project text not null, hash text not null, size integer not null, primary key (project, hash));
 `
+
+/** Larger texts are not merged on the server (a merge of 200k lines costs ~0.4 s of CPU). */
+export const MAX_MERGE_LINES = 200_000
+/** Merges may use about half the server's time, in bursts of up to this many ms. */
+const MERGE_BURST_MS = 2000
+
+/** An op the server has no time for right now: the client retries it shortly. */
+export class Busy extends Error {}
+
+/** Invites stop working this long after they were made; members are unaffected. */
+export const INVITE_TTL = 48 * 60 * 60 * 1000
 
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' // no 0/O or 1/I/L
 export const randomId = (bytes = 16) => randomBytes(bytes).toString('base64url')
@@ -36,12 +48,20 @@ const label = (m: Device) => `${m.name} (${m.deviceName})`
 export class Store {
   readonly dir: string
   readonly db: DatabaseSync
+  readonly quota: number // bytes of blobs per project
+  private mergeDebt = 0 // ms of merge work not yet paid back
+  private debtAt = Date.now()
 
-  constructor(dir: string) {
+  constructor(dir: string, { quota = 5 * 1024 ** 3 } = {}) {
     this.dir = dir
+    this.quota = quota
     mkdirSync(join(dir, 'blobs'), { recursive: true })
     this.db = new DatabaseSync(join(dir, 'server.db'))
     this.db.exec(SCHEMA)
+    // Columns added after the first release: older server.db files get them here.
+    const cols = new Set(this.all<{ name: string }>('pragma table_info(projects)').map(c => c.name))
+    if (!cols.has('owner')) this.db.exec('alter table projects add column owner text')
+    if (!cols.has('code_expires')) this.db.exec(`alter table projects add column code_expires integer not null default ${Date.now() + INVITE_TTL}`)
   }
 
   private one<T>(sql: string, ...args: SQLInputValue[]) {
@@ -72,18 +92,57 @@ export class Store {
 
   createProject(name: string, who: Omit<Device, 'project'>) {
     const id = randomId() // never shown to users; the join code is a separate secret
-    let code: string
-    do code = Array.from({ length: 6 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join('').replace(/^(...)/, '$1-')
-    while (this.one('select 1 from projects where code = ?', code))
-    this.run('insert into projects (id, code, name, created) values (?, ?, ?, ?)', id, code, name, Date.now())
+    const code = this.newCode()
+    this.run('insert into projects (id, code, name, created, owner, code_expires) values (?, ?, ?, ?, ?, ?)', id, code, name, Date.now(), who.device, Date.now() + INVITE_TTL)
     return { projectId: id, name, code, token: this.addMember({ ...who, project: id }) }
   }
 
-  // ponytail: no rate limit on guesses; 31^6 codes are plenty for a hackathon, add one before going public
-  join(code: string, who: Omit<Device, 'project'>) {
+  private newCode() {
+    let code: string
+    do code = Array.from({ length: 6 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join('').replace(/^(...)/, '$1-')
+    while (this.one('select 1 from projects where code = ?', code))
+    return code
+  }
+
+  /**
+   * Guessing is slowed by the server's per-address rate limit; codes also expire. A device that
+   * is already a member must prove it with its current token, so nobody can take over a
+   * teammate's identity by joining with their (visible) device id.
+   */
+  join(code: string, who: Omit<Device, 'project'>, token: string | null = null) {
     const clean = code.toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^(...)/, '$1-')
-    const p = this.one<{ id: string; name: string; code: string }>('select id, name, code from projects where code = ?', clean)
-    return p && { projectId: p.id, name: p.name, code: p.code, token: this.addMember({ ...who, project: p.id }) }
+    const p = this.one<{ id: string; name: string; code: string }>('select id, name, code from projects where code = ? and code_expires > ?', clean, Date.now())
+    if (!p) return undefined
+    const known = this.one<{ token: string }>('select token from members where project = ? and device = ?', p.id, who.device)
+    if (known && (!token || sha256(token) !== known.token))
+      throw Object.assign(new Error('this device has already joined this project'), { status: 409 })
+    return { projectId: p.id, name: p.name, code: p.code, token: this.addMember({ ...who, project: p.id }) }
+  }
+
+  /** The current invite code, replaced by a new one when asked or when it has expired. */
+  invite(project: string, rotate = false) {
+    const p = this.one<{ code: string; expires: number }>('select code, code_expires as expires from projects where id = ?', project)!
+    if (!rotate && p.expires > Date.now()) return p
+    const fresh = { code: this.newCode(), expires: Date.now() + INVITE_TTL }
+    this.run('update projects set code = ?, code_expires = ? where id = ?', fresh.code, fresh.expires, project)
+    return fresh
+  }
+
+  owner(project: string) {
+    return this.one<{ owner: string | null }>('select owner from projects where id = ?', project)?.owner ?? null
+  }
+
+  /**
+   * The project's creator can remove anyone; everyone can remove themselves. Removing someone
+   * else also replaces the invite code, so the old invite can't bring them back.
+   */
+  removeMember(m: Device, device: string) {
+    if (device !== m.device && this.owner(m.project) !== m.device)
+      throw Object.assign(new Error('only the project creator can remove teammates'), { status: 403 })
+    if (!this.one('select 1 from members where project = ? and device = ?', m.project, device))
+      throw Object.assign(new Error('no such member'), { status: 404 })
+    this.run('delete from members where project = ? and device = ?', m.project, device)
+    return device === m.device ? undefined : this.invite(m.project, true)
   }
 
   private addMember(m: Device) {
@@ -105,9 +164,10 @@ export class Store {
   }
 
   members(project: string) {
+    const owner = this.owner(project)
     return this.all<{ device: string; name: string; deviceName: string }>(
       'select device, name, device_name as deviceName from members where project = ? order by joined', project,
-    )
+    ).map(m => ({ ...m, owner: m.device === owner }))
   }
 
   // ── files ───────────────────────────────────────────────────────────────
@@ -128,9 +188,10 @@ export class Store {
     )
   }
 
-  history(project: string, path: string) {
+  /** The newest `limit` versions of a path, oldest first. */
+  history(project: string, path: string, limit = 1000) {
     return this.all<{ version: number; hash: Hash | null; author: string | null; at: number }>(
-      'select version, hash, author, at from versions where project = ? and path = ? order by version', project, path,
+      'select * from (select version, hash, author, at from versions where project = ? and path = ? order by version desc limit ?) order by version', project, path, limit,
     )
   }
 
@@ -146,17 +207,53 @@ export class Store {
     return readFileSync(this.blobPath(project, hash))
   }
 
+  /** Bytes stored for a project (blobs written before sizes were tracked are not counted). */
+  used(project: string) {
+    return this.one<{ n: number }>('select coalesce(sum(size), 0) as n from blobs where project = ?', project)!.n
+  }
+
+  /** Throws unless `bytes` more fit in the project's quota. */
+  reserve(project: string, bytes: number) {
+    if (this.used(project) + bytes > this.quota)
+      throw Object.assign(new Error(`project storage is full (${Math.round(this.quota / 1024 ** 3)} GB)`), { status: 507 })
+  }
+
+  /** A temp file for an upload, inside the blob dir so the final rename stays on one disk. */
+  tempPath() {
+    mkdirSync(join(this.dir, 'blobs', 'tmp'), { recursive: true })
+    return join(this.dir, 'blobs', 'tmp', randomId(12))
+  }
+
   /** Content-addressed and write-once. Never deleted: old versions stay recoverable. */
   putBlob(project: string, bytes: Uint8Array): Hash {
     const hash = sha256(bytes)
-    const file = this.blobPath(project, hash)
-    if (!existsSync(file)) {
-      mkdirSync(dirname(file), { recursive: true })
-      const tmp = `${file}.${randomId(6)}`
+    if (!this.hasBlob(project, hash)) {
+      const tmp = this.tempPath()
       writeFileSync(tmp, bytes)
-      renameSync(tmp, file)
+      this.adoptBlob(project, tmp, hash, bytes.length)
     }
     return hash
+  }
+
+  /**
+   * Moves a fully written temp file into place as blob `hash`. The file is flushed to disk
+   * before the rename, so a commit can never point at a blob a power cut left empty.
+   */
+  adoptBlob(project: string, tmp: string, hash: Hash, size: number, synced = false) {
+    const file = this.blobPath(project, hash)
+    if (existsSync(file)) return void rmSync(tmp, { force: true })
+    if (!synced) {
+      const fd = openSync(tmp, 'r+')
+      try {
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+    }
+    mkdirSync(dirname(file), { recursive: true })
+    renameSync(tmp, file)
+    syncDir(dirname(file))
+    this.run('insert or ignore into blobs (project, hash, size) values (?, ?, ?)', project, hash, size)
   }
 
   /** Applies a batch in order. Returns per-op results and the events to broadcast. */
@@ -170,7 +267,8 @@ export class Store {
         if (r.head) events.push({ type: 'change', head: r.head })
         if (r.conflict) events.push({ type: 'conflict', conflict: r.conflict })
       } catch (e) {
-        results.push({ status: 'error', version: 0, hash: null, error: (e as Error).message })
+        if (e instanceof Busy) results.push({ status: 'busy', version: 0, hash: null, error: e.message })
+        else results.push({ status: 'error', version: 0, hash: null, error: (e as Error).message })
       }
     }
     return { results, events }
@@ -220,13 +318,22 @@ export class Store {
   /** Three-way text merge. undefined = must become a conflict (binary, delete vs edit, overlap). */
   private merge(project: string, base: Hash | null, ours: Hash | null, theirs: Hash | null): Hash | undefined {
     if (ours === null || theirs === null) return undefined
+    // Merges run on the one thread every client shares, so their CPU time is rationed.
+    const now = Date.now()
+    this.mergeDebt = Math.max(0, this.mergeDebt - (now - this.debtAt) / 2)
+    this.debtAt = now
+    if (this.mergeDebt > MERGE_BURST_MS) throw new Busy('server is busy merging; retry shortly')
     try {
       const [o, a, b] = [base, ours, theirs].map(h => (h === null ? new Uint8Array() : this.readBlob(project, h)))
       if (![o, a, b].every(isText)) return undefined
-      const r = merge3(decode(o), decode(a), decode(b))
+      const texts = [o, a, b].map(decode)
+      if (texts.reduce((n, t) => n + lineCount(t), 0) > MAX_MERGE_LINES) return undefined
+      const r = merge3(texts[0], texts[1], texts[2])
       return r.conflicts ? undefined : this.putBlob(project, Buffer.from(r.text))
     } catch {
       return undefined // unknown base or a diff too big to trust: keep both
+    } finally {
+      this.mergeDebt += Date.now() - now
     }
   }
 
@@ -243,10 +350,24 @@ export class Store {
     return h
   }
 
+  /**
+   * A consistent copy of everything in `dest` (which must not exist): a snapshot of the
+   * database, then the blobs. Blobs are written before the commits that use them and never
+   * deleted, so every blob the snapshot refers to is already there when they are copied.
+   */
+  backup(dest: string) {
+    if (existsSync(dest)) throw new Error(`${dest} already exists`)
+    mkdirSync(dest, { recursive: true })
+    this.db.prepare('vacuum into ?').run(join(dest, 'server.db'))
+    cpSync(join(this.dir, 'blobs'), join(dest, 'blobs'), { recursive: true, filter: src => !src.startsWith(join(this.dir, 'blobs', 'tmp')) })
+  }
+
   // ── conflicts ───────────────────────────────────────────────────────────
 
+  /** Open conflicts, or with `all` also the newest resolved ones (up to 1000 in total). */
   conflicts(project: string, all = false): Conflict[] {
-    return this.all<{ data: string }>(`select data from conflicts where project = ? ${all ? '' : "and status = 'open'"} order by rowid`, project).map(r => JSON.parse(r.data))
+    const rows = this.all<{ data: string }>(`select data from conflicts where project = ? ${all ? '' : "and status = 'open'"} order by rowid desc limit 1000`, project)
+    return rows.reverse().map(r => JSON.parse(r.data))
   }
 
   conflict(project: string, id: string): Conflict | undefined {
@@ -273,8 +394,8 @@ export class Store {
   resolve(m: Device, id: string, pick: { choice?: 'A' | 'B'; hash?: Hash | null }) {
     const c = this.openConflict(m.project, id)
     const hash = pick.choice === 'A' ? c.a.hash : pick.choice === 'B' ? c.b.hash : pick.hash
-    if (hash === undefined) throw new Error('choose A, B or provide merged content')
-    if (hash !== null && !this.hasBlob(m.project, hash)) throw new Error('merged content was not uploaded')
+    if (hash === undefined) throw Object.assign(new Error('choose A, B or provide merged content'), { status: 400 })
+    if (hash !== null && !this.hasBlob(m.project, hash)) throw Object.assign(new Error('merged content was not uploaded'), { status: 400 })
     return this.tx(() => {
       c.status = 'resolved'
       c.resolvedBy = label(m)
@@ -289,6 +410,24 @@ export class Store {
     if (c.status !== 'open') throw Object.assign(new Error('conflict already resolved'), { status: 409 })
     return c
   }
+}
+
+function lineCount(s: string) {
+  let n = 0
+  for (let i = s.indexOf('\n'); i >= 0; i = s.indexOf('\n', i + 1)) n++
+  return n
+}
+
+/** Makes a rename durable: the directory entry itself is flushed. */
+function syncDir(dir: string) {
+  try {
+    const fd = openSync(dir, 'r')
+    try {
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+  } catch {} // not supported on every platform; the file itself is already flushed
 }
 
 function checkOp(o: unknown): Op {

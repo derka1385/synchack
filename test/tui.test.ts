@@ -21,9 +21,9 @@ async function until(what: string, cond: () => boolean, ms = 10_000) {
 }
 
 test('invites carry the code and the address in one paste', () => {
-  assert.deepEqual(parseInvite('HX7-K92@192.168.1.129:8787'), { code: 'HX7-K92', server: 'http://192.168.1.129:8787' })
-  assert.deepEqual(parseInvite(' hx7k92@10.0.0.2 '), { code: 'hx7k92', server: 'http://10.0.0.2:8787' })
-  assert.deepEqual(parseInvite('HX7-K92@https://abc.trycloudflare.com/'), { code: 'HX7-K92', server: 'https://abc.trycloudflare.com' })
+  assert.deepEqual(parseInvite('HX7-K92@192.168.1.129:8787'), { code: 'HX7-K92', server: 'http://192.168.1.129:8787', pin: undefined })
+  assert.deepEqual(parseInvite(' hx7k92@10.0.0.2 '), { code: 'hx7k92', server: 'http://10.0.0.2:8787', pin: undefined })
+  assert.deepEqual(parseInvite('HX7-K92@https://abc.trycloudflare.com/'), { code: 'HX7-K92', server: 'https://abc.trycloudflare.com', pin: undefined })
   assert.throws(() => parseInvite('HX7-K92'))
   assert.equal(inviteFor({ code: 'HX7-K92', server: 'http://10.0.0.2:9000' }), 'HX7-K92@10.0.0.2:9000')
 })

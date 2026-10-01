@@ -16,40 +16,44 @@ import { randomBytes } from 'node:crypto'
 import { MAX_FILE, sha256, type Conflict, type Hash, type Head, type Member, type Mode, type Op, type OpResult, type ServerMsg } from '../shared/protocol.ts'
 import { cleanPath, ignoreRules, type Ignore } from '../shared/paths.ts'
 import type { LocalState, Project } from './state.ts'
+import { WebSocket, type ClientOptions } from 'ws'
+import { ConnectError, pinnedCert, request, trust, type Peer } from './net.ts'
 
 /** Server unreachable or failing: retried later, never mistaken for a local file problem. */
 export class NetError extends Error {}
 
-type Target = Pick<Project, 'server' | 'id' | 'token'>
+type Target = Pick<Project, 'server' | 'id' | 'token' | 'cert'>
 
 /** Authenticated call to a project's API. JSON in and out; Uint8Array bodies go raw. */
 export async function call(p: Target, method: string, path: string, body?: unknown): Promise<any> {
   const raw = body instanceof Uint8Array
-  let res: Response
+  let res
   try {
-    res = await fetch(`${p.server}/api/p/${p.id}${path}`, {
-      method,
+    res = await request(p, method, `/api/p/${p.id}${path}`, {
       headers: { authorization: `Bearer ${p.token}`, ...(body !== undefined && !raw ? { 'content-type': 'application/json' } : {}) },
-      body: body === undefined ? undefined : raw ? (body as Uint8Array<ArrayBuffer>) : JSON.stringify(body),
-      signal: AbortSignal.timeout(60_000),
+      body: body === undefined ? undefined : raw ? body : JSON.stringify(body),
     })
   } catch (e) {
     throw new NetError(`${method} ${path}: ${(e as Error).message}`)
   }
-  if (!res.ok) throw new NetError(`${method} ${path}: ${res.status} ${await res.text()}`)
+  if (res.status < 200 || res.status > 299) throw new NetError(`${method} ${path}: ${res.status} ${res.body}`)
   if (res.status === 204) return undefined
-  return res.headers.get('content-type')?.startsWith('application/json') ? res.json() : Buffer.from(await res.arrayBuffer())
+  return res.type.startsWith('application/json') ? JSON.parse(res.body.toString()) : res.body
 }
 
-async function post(server: string, path: string, body: unknown) {
-  let res: Response
+async function post(peer: Peer, path: string, body: unknown, token?: string) {
+  let res
   try {
-    res = await fetch(server + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-  } catch {
-    throw new Error(`can't reach the sync server at ${server}. Is it running, and is --server its address? ("localhost" is the Mac you type it on.)`)
+    res = await request(peer, 'POST', path, { headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body) })
+  } catch (e) {
+    if (!(e instanceof ConnectError)) throw e
+    throw new Error(`can't reach the sync server at ${peer.server} (${e.message}). Is it running, and is --server its address? ("localhost" is the Mac you type it on.)`)
   }
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(data.error ?? `${path}: HTTP ${res.status}`)
+  let data: any = {}
+  try {
+    data = JSON.parse(res.body.toString())
+  } catch {}
+  if (res.status < 200 || res.status > 299) throw new Error(data.error ?? `${path}: HTTP ${res.status}`)
   return data
 }
 
@@ -61,23 +65,34 @@ function claim(state: LocalState, dir: string) {
   return root
 }
 
-/** Registers a new shared project. Existing files in `dir` are imported on the first sync. */
-export async function createProject(state: LocalState, server: string, dir: string, name = basename(dir)) {
+/**
+ * Registers a new shared project. Existing files in `dir` are imported on the first sync.
+ * `cert` is the server's self-signed certificate, when it has one (a Mac hosting itself).
+ */
+export async function createProject(state: LocalState, server: string, dir: string, name = basename(dir), cert: string | null = null) {
   const root = claim(state, dir)
-  const r = await post(server, '/api/projects', { name, ...state.identity() })
-  const p: Project = { id: r.projectId, name: r.name, root, server, token: r.token, code: r.code, mode: 'live', seq: 0 }
+  const r = await post({ server, cert }, '/api/projects', { name, ...state.identity() })
+  const p: Project = { id: r.projectId, name: r.name, root, server, token: r.token, code: r.code, mode: 'live', seq: 0, cert }
   state.addProject(p)
   return p
 }
 
-/** Registers an existing project by join code. `dir` may depend on the project's name. Files arrive on the first sync. */
-export async function joinProject(state: LocalState, server: string, code: string, dir: string | ((name: string) => string)) {
-  const r = await post(server, '/api/join', { code, ...state.identity() })
+/**
+ * Registers an existing project by join code. `dir` may depend on the project's name. Files
+ * arrive on the first sync. With `pin` (from the invite) the server must hold that key.
+ */
+export async function joinProject(state: LocalState, server: string, code: string, dir: string | ((name: string) => string), pin?: string) {
+  const cert = pin ? await pinnedCert(server, pin) : null
+  const r = await post({ server, cert }, '/api/join', { code, ...state.identity() })
   const root = claim(state, typeof dir === 'string' ? dir : dir(r.name))
-  const p: Project = { id: r.projectId, name: r.name, root, server, token: r.token, code: r.code, mode: 'live', seq: 0 }
+  const p: Project = { id: r.projectId, name: r.name, root, server, token: r.token, code: r.code, mode: 'live', seq: 0, cert }
   state.addProject(p)
   return p
 }
+
+/** Files that agents, editors or shells execute or load as configuration: a change to one is worth a look. */
+const RUNS_CODE = /^(\.claude|\.vscode|\.cursor|\.husky|\.devcontainer|\.github\/workflows)\/|(^|\/)(package\.json|\.envrc|\.npmrc|Makefile|CLAUDE\.md|AGENTS\.md|\.mcp\.json)$/
+export const runsCode = (path: string) => RUNS_CODE.test(path)
 
 export interface SyncOptions {
   liveMs?: number // debounce after the last event on a file
@@ -85,6 +100,8 @@ export interface SyncOptions {
   reconnectMaxMs?: number
 }
 
+const REMOVED = 4001 // WebSocket close code: this device was removed from the project
+const MASS_DELETE = 50 // files deleted in one round that pause sync (see massDelete)
 const BATCH_FILES = 500
 const BATCH_BYTES = 32 * 1024 * 1024
 
@@ -117,6 +134,8 @@ export class ProjectSync extends EventEmitter {
   private backoff = 0
   private lastMsg = 0
   private stopped = false
+  private unconfirmed: string[] = [] // deletions held by the mass-deletion guard
+  private confirmed = new Set<string>() // ...and those the user let through by resuming
   private reconnect?: NodeJS.Timeout
   private heartbeat?: NodeJS.Timeout
 
@@ -166,7 +185,15 @@ export class ProjectSync extends EventEmitter {
     this.mode = this.p.mode = mode
     this.state.setMode(this.p.id, mode)
     if (mode === 'paused') this.ws && this.drop(this.ws) // local edits pile up; reconciled on resume
-    else if (was === 'paused') this.connect()
+    else if (was === 'paused') {
+      if (this.errors.get('')?.includes('deleted at once')) {
+        this.errors.delete('')
+        // Resuming is the answer: send the deletions of whatever is still missing (not restored).
+        this.confirmed = new Set(this.unconfirmed.filter(path => !existsSync(join(this.root, path))))
+        this.unconfirmed = []
+      }
+      this.connect()
+    }
     else for (const path of [...this.timers.keys()]) this.touch(path) // re-arm with the new delay
     this.log(`mode: ${mode}`)
     this.emit('status')
@@ -351,6 +378,7 @@ export class ProjectSync extends EventEmitter {
         const opId = sha256(`${this.state.device}\n${path}\n${st.version}\n${st.hash}\n${hash}`)
         ops.push({ opId, path, baseVersion: st.version, baseHash: st.hash, hash })
       }
+      if (await this.massDelete(ops)) return
       ops.sort((x, y) => Number(x.hash !== null) - Number(y.hash !== null)) // deletes first (case-only renames)
       if (!existsSync(this.root)) return this.fail('', 'project folder is missing; sync stopped') // moved mid-flush
       try {
@@ -362,6 +390,33 @@ export class ProjectSync extends EventEmitter {
         return
       }
     }
+  }
+
+  /**
+   * An emptied folder, a branch switch or a stray `rm -r` would delete the files on every Mac.
+   * When one round deletes many files (not counting moves), pause instead and ask: resuming
+   * (`synchack live`) sends the deletions, and restoring the files cancels them.
+   */
+  private async massDelete(ops: Op[]) {
+    const tracked = this.state.tracked(this.p.id).length
+    const many = (n: number) => n >= MASS_DELETE || (n >= 10 && n > tracked / 2)
+    let gone = ops.filter(o => o.hash === null && o.baseHash !== null && !this.confirmed.has(o.path))
+    for (const op of ops) this.confirmed.delete(op.path)
+    if (!many(gone.length)) return false
+    // A moved folder shows up as deletions plus new files with the same content, maybe not in this round yet.
+    const moved = new Set(ops.map(o => o.hash))
+    for (const path of await this.walk(''))
+      if (this.state.file(this.p.id, path).hash === null) moved.add((await this.read(path).catch(() => null))?.hash ?? null)
+    gone = gone.filter(o => !moved.has(o.baseHash))
+    const deletes = gone.length
+    if (!many(deletes)) return false
+    for (const op of ops) this.ready.add(op.path)
+    this.unconfirmed = gone.map(o => o.path)
+    this.setMode('paused')
+    const msg = `${deletes} files were deleted at once, so sync is paused. To send the deletions, switch to live (synchack live); to undo them, restore the files first (synchack restore).`
+    this.errors.set('', msg)
+    this.log(msg)
+    return true
   }
 
   private async push(ops: Op[], blobs: Map<Hash, Buffer>) {
@@ -403,6 +458,11 @@ export class ProjectSync extends EventEmitter {
       this.blocked.add(path)
     } else if (r.status === 'blocked') {
       this.blocked.add(path)
+    } else if (r.status === 'busy') {
+      setTimeout(() => {
+        this.ready.add(path)
+        this.kick()
+      }, 2000).unref()
     } else this.fail(path, r.error ?? 'rejected by server')
   }
 
@@ -442,6 +502,7 @@ export class ProjectSync extends EventEmitter {
         this.stale.delete(path)
         this.errors.delete(path)
         if (disk !== h.hash) this.log(`↓ ${path}${h.author ? ` from ${h.author.replace(/ \(.*\)$/, '')}` : ''}`)
+        if (disk !== h.hash && h.hash !== null && runsCode(path)) this.log(`⚠ ${path} changed: tools on this Mac may run what it contains, so check it`)
         return
       }
       // Unsynced local edits: never overwrite them. Upload instead; the server merges.
@@ -517,7 +578,7 @@ export class ProjectSync extends EventEmitter {
   private connect() {
     if (this.stopped || this.ws || this.mode === 'paused') return
     const url = `${this.p.server.replace(/^http/, 'ws')}/api/p/${this.p.id}/ws?token=${encodeURIComponent(this.p.token)}&since=${this.p.seq}`
-    const ws = new WebSocket(url)
+    const ws = new WebSocket(url, { ...(trust(this.p.cert) as ClientOptions), maxPayload: 256 * 1024 * 1024 })
     this.ws = ws
     this.lastMsg = Date.now()
     ws.onmessage = e => {
@@ -530,14 +591,20 @@ export class ProjectSync extends EventEmitter {
       }
       this.enqueue(() => this.receive(ws, msg))
     }
-    ws.onclose = () => this.drop(ws)
+    ws.onclose = e => this.drop(ws, e.code)
     ws.onerror = () => {} // onclose follows
   }
 
-  private drop(ws: WebSocket) {
+  private drop(ws: WebSocket, code?: number) {
     if (this.ws !== ws) return
     this.ws = undefined
     ws.close()
+    if (code === REMOVED) {
+      this.online = false
+      this.errors.set('', 'no longer a member of this project; not syncing')
+      this.log('no longer a member of this project; stopped syncing')
+      return void this.emit('status')
+    }
     if (this.online && !this.stopped && this.mode !== 'paused') this.log('offline; changes stay local until the server is back')
     this.online = false
     this.emit('status')

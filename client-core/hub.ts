@@ -2,7 +2,7 @@
 // created here. Used by the terminal UI and by `synchack run`.
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readdirSync, readFileSync, renameSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { startServer, type Server } from '../server/server.ts'
@@ -80,6 +80,16 @@ export async function keepLocal(p: Project, c: Conflict) {
   return call(p, 'POST', `/conflicts/${c.id}/resolve`, { hash: bytes && sha256(bytes) })
 }
 
+/** Appends the hosted server's log lines to `file`, keeping it and one older file of up to 5 MB each. */
+function serverLog(file: string) {
+  return (line: string) => {
+    try {
+      if (existsSync(file) && statSync(file).size > 5 * 1024 * 1024) renameSync(file, `${file}.1`)
+      appendFileSync(file, `${new Date().toISOString()} ${line}\n`)
+    } catch {} // logging must never break hosting
+  }
+}
+
 export function alive(pid: number) {
   try {
     process.kill(pid, 0)
@@ -130,7 +140,7 @@ export class Hub extends EventEmitter {
 
   private async host(port: number) {
     try {
-      this.hosting = await startServer({ port, dataDir: join(this.state.home, 'server'), localCreateOnly: true })
+      this.hosting = await startServer({ port, dataDir: join(this.state.home, 'server'), localCreateOnly: true, log: serverLog(join(this.state.home, 'server.log')) })
       this.serverUrl = this.hosting.url
     } catch {
       // Port taken: fine if it is already a synchack server (e.g. `npm run server`).

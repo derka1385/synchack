@@ -188,3 +188,20 @@ test('WebSocket messages from clients are capped', async t => {
   ws.send('x'.repeat(100_000))
   assert.equal(await closed, 1009)
 })
+
+test('requests are logged without secrets; unexpected errors are hidden from callers', async t => {
+  const lines: string[] = []
+  const x = await server({ log: l => lines.push(l) })
+  t.after(() => x.close())
+  const alice = await x.create()
+  await x.api('GET', `/api/p/${alice.projectId}/heads`, undefined, alice.token)
+  x.s.store.heads = () => {
+    throw new Error('disk on fire at /secret/path')
+  }
+  const r = await x.api('GET', `/api/p/${alice.projectId}/heads`, undefined, alice.token)
+  assert.deepEqual([r.status, r.body], [500, { error: 'internal server error' }])
+  await new Promise(ok => setTimeout(ok, 50))
+  assert.ok(lines.some(l => l.startsWith('GET /api/p/:id/heads 200 ') && l.includes('alice (Mac)')), lines.join('\n'))
+  assert.ok(lines.some(l => l.includes('disk on fire')), 'the real error is in the log')
+  assert.ok(!lines.join('\n').includes(alice.token), 'tokens never reach the log')
+})

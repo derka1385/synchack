@@ -189,9 +189,10 @@ export class Store {
     )
   }
 
-  history(project: string, path: string) {
+  /** The newest `limit` versions of a path, oldest first. */
+  history(project: string, path: string, limit = 1000) {
     return this.all<{ version: number; hash: Hash | null; author: string | null; at: number }>(
-      'select version, hash, author, at from versions where project = ? and path = ? order by version', project, path,
+      'select * from (select version, hash, author, at from versions where project = ? and path = ? order by version desc limit ?) order by version', project, path, limit,
     )
   }
 
@@ -352,8 +353,10 @@ export class Store {
 
   // ── conflicts ───────────────────────────────────────────────────────────
 
+  /** Open conflicts, or with `all` also the newest resolved ones (up to 1000 in total). */
   conflicts(project: string, all = false): Conflict[] {
-    return this.all<{ data: string }>(`select data from conflicts where project = ? ${all ? '' : "and status = 'open'"} order by rowid`, project).map(r => JSON.parse(r.data))
+    const rows = this.all<{ data: string }>(`select data from conflicts where project = ? ${all ? '' : "and status = 'open'"} order by rowid desc limit 1000`, project)
+    return rows.reverse().map(r => JSON.parse(r.data))
   }
 
   conflict(project: string, id: string): Conflict | undefined {
@@ -380,8 +383,8 @@ export class Store {
   resolve(m: Device, id: string, pick: { choice?: 'A' | 'B'; hash?: Hash | null }) {
     const c = this.openConflict(m.project, id)
     const hash = pick.choice === 'A' ? c.a.hash : pick.choice === 'B' ? c.b.hash : pick.hash
-    if (hash === undefined) throw new Error('choose A, B or provide merged content')
-    if (hash !== null && !this.hasBlob(m.project, hash)) throw new Error('merged content was not uploaded')
+    if (hash === undefined) throw Object.assign(new Error('choose A, B or provide merged content'), { status: 400 })
+    if (hash !== null && !this.hasBlob(m.project, hash)) throw Object.assign(new Error('merged content was not uploaded'), { status: 400 })
     return this.tx(() => {
       c.status = 'resolved'
       c.resolvedBy = label(m)

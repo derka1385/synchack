@@ -2,6 +2,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createReadStream, rmSync } from 'node:fs'
 import { open } from 'node:fs/promises'
+import { pipeline } from 'node:stream/promises'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -34,12 +35,14 @@ export interface ServerOptions {
   rateLimit?: { max: number; windowMs: number; limitLoopback?: boolean }
   /** Blob storage per project, in bytes. */
   quota?: number
+  /** One line per request and every server error. Default: silent. */
+  log?: (line: string) => void
 }
 
 const MAX_UPLOADS = 16 // blob uploads in flight at once, across all clients
 const MAX_JSON = 2 * 1024 * 1024 // 1000 ops is about 300 KB
 
-export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 }, quota }: ServerOptions = {}): Promise<Server> {
+export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 }, quota, log = () => {} }: ServerOptions = {}): Promise<Server> {
   const store = new Store(dataDir, { quota })
   let uploads = 0
   const limiter = new RateLimit(rateLimit.max, rateLimit.windowMs)
@@ -55,10 +58,19 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     return store.members(project).map(m => ({ ...m, online: online.has(m.device) }))
   }
 
+  const caller = new WeakMap<IncomingMessage, Device>()
   const http = createServer((req, res) => {
+    const start = Date.now()
+    res.on('close', () => {
+      const me = caller.get(req)
+      log(`${req.method} ${routeName(req.url)} ${res.statusCode} ${Date.now() - start}ms ${req.socket.remoteAddress ?? '-'}${me ? ` ${me.project} ${me.name} (${me.deviceName})` : ''}`)
+    })
     route(req, res).catch(e => {
+      const status = e.status ?? (e instanceof SyntaxError ? 400 : 500)
+      // Unexpected errors are logged in full and never shown to callers.
+      if (status >= 500 && !e.status) log(`error in ${req.method} ${routeName(req.url)}: ${e.stack ?? e}`)
       if (res.headersSent) return res.destroy()
-      reply(res, e.status ?? (e instanceof SyntaxError ? 400 : 500), { error: e.message })
+      reply(res, status, { error: status >= 500 && !e.status ? 'internal server error' : e.message })
     })
   })
 
@@ -74,7 +86,8 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     if (key === 'GET /install.tgz') {
       res.writeHead(200, { 'content-type': 'application/gzip' })
       const tar = spawn('tar', ['-cz', '-C', APP, 'package.json', 'package-lock.json', 'shared', 'server', 'client-core'], { stdio: ['ignore', 'pipe', 'ignore'] })
-      return void tar.stdout.pipe(res)
+      tar.on('error', e => log(`install.tgz: ${e.message}`)) // e.g. no tar: the download just fails
+      return void pipeline(tar.stdout, res).catch(() => tar.kill())
     }
     if (key === 'POST /api/projects' || key === 'POST /api/join') {
       const ip = req.socket.remoteAddress ?? ''
@@ -99,6 +112,7 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     const [, project, rest] = m
     const me = store.auth(project, bearer(req))
     if (!me) throw new HttpError(401, 'not a member of this project')
+    caller.set(req, me)
 
     if (rest === '/ops' && req.method === 'POST') {
       const { ops } = await json(req)
@@ -133,7 +147,7 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     if (blob && req.method === 'GET') {
       if (!store.hasBlob(project, blob)) throw new HttpError(404, 'no such blob')
       res.writeHead(200, { 'content-type': 'application/octet-stream' })
-      return void createReadStream(store.blobPath(project, blob)).pipe(res)
+      return void pipeline(createReadStream(store.blobPath(project, blob)), res).catch(() => res.destroy())
     }
     if (rest === '/conflicts' && req.method === 'GET') return reply(res, 200, { conflicts: store.conflicts(project, url.searchParams.has('all')) })
     const c = rest.match(/^\/conflicts\/([\w-]{1,64})(?:\/(vote|resolve))?$/)
@@ -225,6 +239,7 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
       })
       ws.on('close', () => {
         room.delete(ws)
+        if (!room.size && rooms.get(me.project) === room) rooms.delete(me.project)
         if (!closing) send(me.project, { type: 'members', members: members(me.project) })
       })
     })
@@ -291,6 +306,10 @@ fi
 echo "Done. Open a new Terminal window and type: /synchack"
 `
 
+/** The route without ids or hashes, for logs. */
+const routeName = (url = '/') =>
+  url.split('?')[0].replace(/^\/api\/p\/[^/]+/, '/api/p/:id').replace(/[0-9a-f]{64}/, ':hash').replace(/\/(conflicts|members)\/[^/]+/, '/$1/:id')
+
 const bearer = (req: IncomingMessage) => req.headers.authorization?.match(/^Bearer (.+)$/)?.[1] ?? null
 const isLoopback = (ip: string) => ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
 
@@ -345,7 +364,28 @@ function text(v: unknown, field: string) {
 const who = (b: Record<string, unknown>) => ({ device: text(b.device, 'device'), name: text(b.user, 'user'), deviceName: text(b.deviceName, 'deviceName') })
 
 if (import.meta.main) {
-  const s = await startServer({ port: Number(process.env.PORT ?? 8787), dataDir: process.env.DATA_DIR ?? 'data' })
+  const stamp = (line: string) => `${new Date().toISOString()} ${line}`
+  const s = await startServer({
+    port: Number(process.env.PORT ?? 8787),
+    dataDir: process.env.DATA_DIR ?? 'data',
+    quota: process.env.SYNCHACK_QUOTA_GB ? Number(process.env.SYNCHACK_QUOTA_GB) * 1024 ** 3 : undefined,
+    log: line => console.log(stamp(line)),
+  })
+  let stopping = false
+  const stop = (why: string, code = 0) => {
+    if (stopping) return
+    stopping = true
+    console.log(stamp(`${why}; shutting down`))
+    void s.close().finally(() => process.exit(code))
+    setTimeout(() => process.exit(code), 5000).unref()
+  }
+  process.once('SIGTERM', () => stop('SIGTERM'))
+  process.once('SIGINT', () => stop('SIGINT'))
+  // State may be inconsistent after an unexpected throw: log it, close the database, exit, and let the supervisor restart us.
+  process.on('uncaughtException', e => {
+    console.error(stamp(`uncaught: ${e.stack ?? e}`))
+    stop('uncaught exception', 1)
+  })
   const lan = lanAddresses().map(ip => `http://${ip}:${s.port}`)
   console.log(`synchack server listening on port ${s.port}, all interfaces (data in ${process.env.DATA_DIR ?? 'data'})`)
   console.log(lan.length ? `teammates connect with:  --server ${lan.join('   or   ')}` : 'no network address: only this Mac can connect')

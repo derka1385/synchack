@@ -1,11 +1,13 @@
 // HTTP for commands and blobs, one WebSocket per client for pushed events.
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { createReadStream } from 'node:fs'
+import { createReadStream, rmSync } from 'node:fs'
+import { open } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import type { AddressInfo } from 'node:net'
 import { WebSocketServer, type WebSocket } from 'ws'
-import { HASH_RE, MAX_FILE, lanAddresses, sha256, type Member, type ServerMsg } from '../shared/protocol.ts'
+import { HASH_RE, MAX_FILE, lanAddresses, type Member, type ServerMsg } from '../shared/protocol.ts'
 import { Store, type Device } from './store.ts'
 
 class HttpError extends Error {
@@ -30,10 +32,16 @@ export interface ServerOptions {
   localCreateOnly?: boolean
   /** Join and create attempts allowed per address per window. Loopback is exempt unless `limitLoopback`. */
   rateLimit?: { max: number; windowMs: number; limitLoopback?: boolean }
+  /** Blob storage per project, in bytes. */
+  quota?: number
 }
 
-export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 } }: ServerOptions = {}): Promise<Server> {
-  const store = new Store(dataDir)
+const MAX_UPLOADS = 16 // blob uploads in flight at once, across all clients
+const MAX_JSON = 2 * 1024 * 1024 // 1000 ops is about 300 KB
+
+export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 }, quota }: ServerOptions = {}): Promise<Server> {
+  const store = new Store(dataDir, { quota })
+  let uploads = 0
   const limiter = new RateLimit(rateLimit.max, rateLimit.windowMs)
   const rooms = new Map<string, Map<WebSocket, { me: Device; alive: boolean }>>()
   let closing = false
@@ -101,14 +109,25 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     }
     if (rest === '/blobs/missing' && req.method === 'POST') {
       const { hashes } = await json(req)
-      if (!Array.isArray(hashes)) throw new HttpError(400, 'hashes must be an array')
+      if (!Array.isArray(hashes) || hashes.length > 1000) throw new HttpError(400, 'hashes must be an array of at most 1000')
       return reply(res, 200, { missing: hashes.filter(h => typeof h === 'string' && HASH_RE.test(h) && !store.hasBlob(project, h)) })
     }
     const blob = rest.match(/^\/blobs\/([0-9a-f]{64})$/)?.[1]
     if (blob && req.method === 'PUT') {
-      const bytes = await body(req, MAX_FILE)
-      if (sha256(bytes) !== blob) throw new HttpError(400, 'content does not match its hash')
-      store.putBlob(project, bytes)
+      const size = Number(req.headers['content-length'] ?? 0)
+      if (size > MAX_FILE) throw new HttpError(413, 'too large')
+      if (store.hasBlob(project, blob)) {
+        req.resume()
+        return reply(res, 204)
+      }
+      store.reserve(project, size)
+      if (uploads >= MAX_UPLOADS) throw new HttpError(503, 'too many uploads at once; retry shortly')
+      uploads++
+      try {
+        await receiveBlob(req, project, blob)
+      } finally {
+        uploads--
+      }
       return reply(res, 204)
     }
     if (blob && req.method === 'GET') {
@@ -157,7 +176,34 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     throw new HttpError(404, 'not found')
   }
 
-  const wss = new WebSocketServer({ noServer: true })
+  /** Streams an upload to disk while hashing it, so a 100 MB file never sits in memory. */
+  async function receiveBlob(req: IncomingMessage, project: string, hash: string) {
+    const tmp = store.tempPath()
+    const digest = createHash('sha256')
+    let size = 0
+    try {
+      const fh = await open(tmp, 'w')
+      try {
+        for await (const chunk of req as AsyncIterable<Buffer>) {
+          size += chunk.length
+          if (size > MAX_FILE) throw new HttpError(413, 'too large')
+          digest.update(chunk)
+          await fh.write(chunk)
+        }
+        await fh.sync()
+      } finally {
+        await fh.close()
+      }
+      if (digest.digest('hex') !== hash) throw new HttpError(400, 'content does not match its hash')
+      store.adoptBlob(project, tmp, hash, size, true)
+    } catch (e) {
+      rmSync(tmp, { force: true })
+      throw e
+    }
+  }
+
+  // Clients never send anything but pongs, so any real message is refused.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 4096 })
   http.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://x')
     const project = url.pathname.match(/^\/api\/p\/([\w-]{1,64})\/ws$/)?.[1]
@@ -172,6 +218,7 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
       const hello: ServerMsg = { type: 'hello', seq: store.seq(me.project), heads: store.heads(me.project, since), conflicts: store.conflicts(me.project), members: members(me.project) }
       ws.send(JSON.stringify(hello))
       send(me.project, { type: 'members', members: members(me.project) })
+      ws.on('error', () => ws.terminate()) // e.g. an oversized message; without a listener it would crash the server
       ws.on('pong', () => {
         const s = room.get(ws)
         if (s) s.alive = true
@@ -285,7 +332,7 @@ async function body(req: IncomingMessage, limit: number) {
 }
 
 async function json(req: IncomingMessage) {
-  const v = JSON.parse((await body(req, 16 * 1024 * 1024)).toString() || '{}')
+  const v = JSON.parse((await body(req, MAX_JSON)).toString() || '{}')
   if (!v || typeof v !== 'object') throw new HttpError(400, 'expected a JSON object')
   return v as Record<string, any>
 }

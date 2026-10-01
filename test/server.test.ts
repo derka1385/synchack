@@ -1,12 +1,12 @@
 // Server API: authentication, invites, membership and limits, without any client engine.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { startServer, type ServerOptions } from '../server/server.ts'
-import { INVITE_TTL } from '../server/store.ts'
-import { lanAddresses } from '../shared/protocol.ts'
+import { INVITE_TTL, MAX_MERGE_LINES } from '../server/store.ts'
+import { lanAddresses, sha256 } from '../shared/protocol.ts'
 
 async function server(opts: ServerOptions = {}) {
   const dataDir = mkdtempSync(join(tmpdir(), 'synchack-server-'))
@@ -109,4 +109,82 @@ test('a hosting Mac only creates projects for itself', async t => {
   if (!ip) return t.skip('no network address to call from')
   const remote = await x.api('POST', '/api/projects', { name: 'theirs', ...x.me('eve') }, undefined, `http://${ip}:${x.s.port}`)
   assert.equal(remote.status, 403)
+})
+
+/** Uploads `files` as v1 of each path, then returns a helper that sends ops against base v1. */
+async function seeded(x: Awaited<ReturnType<typeof server>>, files: Record<string, string>) {
+  const alice = await x.create()
+  const p = `/api/p/${alice.projectId}`
+  const put = async (text: string) => {
+    const bytes = Buffer.from(text)
+    const hash = sha256(bytes)
+    const r = await fetch(`${x.s.url}${p}/blobs/${hash}`, { method: 'PUT', headers: { authorization: `Bearer ${alice.token}` }, body: new Uint8Array(bytes) })
+    assert.equal(r.status, 204)
+    return hash
+  }
+  const ops = async (list: { path: string; base: string | null; text: string }[]) => {
+    const body = { ops: await Promise.all(list.map(async (o, i) => ({ opId: `${o.path}-${i}-${Math.random()}`, path: o.path, baseVersion: 0, baseHash: o.base, hash: await put(o.text) }))) }
+    return (await x.api('POST', `${p}/ops`, body, alice.token)).body.results as { status: string }[]
+  }
+  const bases: Record<string, string> = {}
+  for (const [path, text] of Object.entries(files)) {
+    bases[path] = await put(text)
+    assert.equal((await ops([{ path, base: null, text }]))[0].status, 'ok')
+  }
+  return { alice, p, put, ops, bases }
+}
+
+const numbered = (n: number, tag = '', every = 0) => Array.from({ length: n }, (_, i) => (every && i % every === 0 ? `${tag}${i}\n` : `line ${i}\n`)).join('')
+
+test('server merges are rationed: one request cannot monopolise the server', async t => {
+  const x = await server()
+  t.after(() => x.close())
+  const { ops, bases, alice } = await seeded(x, { 'a.txt': numbered(50) })
+  // Move the head on, then send a change against the old base: it needs a merge.
+  await ops([{ path: 'a.txt', base: bases['a.txt'], text: numbered(50).replace('line 1\n', 'one\n') }])
+  ;(x.s.store as unknown as { mergeDebt: number }).mergeDebt = 60_000 // as if it had just merged for a minute
+  const [busy] = await ops([{ path: 'a.txt', base: bases['a.txt'], text: numbered(50).replace('line 40\n', 'forty\n') }])
+  assert.equal(busy.status, 'busy')
+  ;(x.s.store as unknown as { mergeDebt: number }).mergeDebt = 0
+  const [merged] = await ops([{ path: 'a.txt', base: bases['a.txt'], text: numbered(50).replace('line 40\n', 'forty\n') }])
+  assert.equal(merged.status, 'merged', 'the same change goes through once the server has time')
+  assert.ok(alice)
+})
+
+test('texts too long to merge cheaply become conflicts instead of stalling the server', async t => {
+  const x = await server()
+  t.after(() => x.close())
+  const big = numbered(MAX_MERGE_LINES / 2)
+  const { ops, bases } = await seeded(x, { 'big.txt': big })
+  await ops([{ path: 'big.txt', base: bases['big.txt'], text: big.replace('line 1\n', 'one\n') }])
+  const start = Date.now()
+  const [r] = await ops([{ path: 'big.txt', base: bases['big.txt'], text: big.replace('line 9000\n', 'nine thousand\n') }])
+  assert.equal(r.status, 'conflict')
+  assert.ok(Date.now() - start < 2000, `took ${Date.now() - start} ms`)
+})
+
+test('uploads: hash checked while streaming, quota enforced, nothing left behind', async t => {
+  const x = await server({ quota: 1000 })
+  t.after(() => x.close())
+  const alice = await x.create()
+  const p = `${x.s.url}/api/p/${alice.projectId}`
+  const put = (hash: string, body: Buffer) => fetch(`${p}/blobs/${hash}`, { method: 'PUT', headers: { authorization: `Bearer ${alice.token}` }, body: new Uint8Array(body) })
+  const small = Buffer.from('hello')
+  assert.equal((await put(sha256(Buffer.from('other')), small)).status, 400)
+  assert.equal((await put(sha256(small), small)).status, 204)
+  assert.equal((await put(sha256(small), small)).status, 204, 'an existing blob is accepted again')
+  const big = Buffer.alloc(2000, 1)
+  assert.equal((await put(sha256(big), big)).status, 507)
+  assert.deepEqual(readdirSync(join(x.s.store.dir, 'blobs', 'tmp')), [], 'no temp files left over')
+})
+
+test('WebSocket messages from clients are capped', async t => {
+  const x = await server()
+  t.after(() => x.close())
+  const alice = await x.create()
+  const ws = new WebSocket(`${x.s.url.replace('http', 'ws')}/api/p/${alice.projectId}/ws?token=${alice.token}`)
+  const closed = new Promise<number>(ok => (ws.onclose = e => ok(e.code)))
+  await new Promise(ok => (ws.onopen = ok))
+  ws.send('x'.repeat(100_000))
+  assert.equal(await closed, 1009)
 })

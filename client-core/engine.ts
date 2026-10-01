@@ -404,6 +404,11 @@ export class ProjectSync extends EventEmitter {
       this.blocked.add(path)
     } else if (r.status === 'blocked') {
       this.blocked.add(path)
+    } else if (r.status === 'busy') {
+      setTimeout(() => {
+        this.ready.add(path)
+        this.kick()
+      }, 2000).unref()
     } else this.fail(path, r.error ?? 'rejected by server')
   }
 

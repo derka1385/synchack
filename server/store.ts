@@ -4,7 +4,7 @@
 
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { randomBytes, randomInt } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { HASH_RE, sha256, type Conflict, type Hash, type Head, type Op, type OpResult, type ServerMsg } from '../shared/protocol.ts'
 import { cleanPath } from '../shared/paths.ts'
@@ -27,7 +27,16 @@ const SCHEMA = `
   create index if not exists versions_by_op on versions (project, op);
   create table if not exists conflicts (id text primary key, project text not null, path text not null, op text, status text not null, data text not null);
   create index if not exists conflicts_by_path on conflicts (project, path, status);
+  create table if not exists blobs (project text not null, hash text not null, size integer not null, primary key (project, hash));
 `
+
+/** Larger texts are not merged on the server (a merge of 200k lines costs ~0.4 s of CPU). */
+export const MAX_MERGE_LINES = 200_000
+/** Merges may use about half the server's time, in bursts of up to this many ms. */
+const MERGE_BURST_MS = 2000
+
+/** An op the server has no time for right now: the client retries it shortly. */
+export class Busy extends Error {}
 
 /** Invites stop working this long after they were made; members are unaffected. */
 export const INVITE_TTL = 48 * 60 * 60 * 1000
@@ -39,9 +48,14 @@ const label = (m: Device) => `${m.name} (${m.deviceName})`
 export class Store {
   readonly dir: string
   readonly db: DatabaseSync
+  readonly quota: number // bytes of blobs per project
+  private mergeDebt = 0 // ms of merge work not yet paid back
+  private debtAt = Date.now()
 
-  constructor(dir: string) {
+  constructor(dir: string, { quota = 5 * 1024 ** 3 } = {}) {
     this.dir = dir
+    this.quota = quota
+    rmSync(join(dir, 'blobs', 'tmp'), { recursive: true, force: true }) // uploads cut off by a restart
     mkdirSync(join(dir, 'blobs'), { recursive: true })
     this.db = new DatabaseSync(join(dir, 'server.db'))
     this.db.exec(SCHEMA)
@@ -193,17 +207,53 @@ export class Store {
     return readFileSync(this.blobPath(project, hash))
   }
 
+  /** Bytes stored for a project (blobs written before sizes were tracked are not counted). */
+  used(project: string) {
+    return this.one<{ n: number }>('select coalesce(sum(size), 0) as n from blobs where project = ?', project)!.n
+  }
+
+  /** Throws unless `bytes` more fit in the project's quota. */
+  reserve(project: string, bytes: number) {
+    if (this.used(project) + bytes > this.quota)
+      throw Object.assign(new Error(`project storage is full (${Math.round(this.quota / 1024 ** 3)} GB)`), { status: 507 })
+  }
+
+  /** A temp file for an upload, inside the blob dir so the final rename stays on one disk. */
+  tempPath() {
+    mkdirSync(join(this.dir, 'blobs', 'tmp'), { recursive: true })
+    return join(this.dir, 'blobs', 'tmp', randomId(12))
+  }
+
   /** Content-addressed and write-once. Never deleted: old versions stay recoverable. */
   putBlob(project: string, bytes: Uint8Array): Hash {
     const hash = sha256(bytes)
-    const file = this.blobPath(project, hash)
-    if (!existsSync(file)) {
-      mkdirSync(dirname(file), { recursive: true })
-      const tmp = `${file}.${randomId(6)}`
+    if (!this.hasBlob(project, hash)) {
+      const tmp = this.tempPath()
       writeFileSync(tmp, bytes)
-      renameSync(tmp, file)
+      this.adoptBlob(project, tmp, hash, bytes.length)
     }
     return hash
+  }
+
+  /**
+   * Moves a fully written temp file into place as blob `hash`. The file is flushed to disk
+   * before the rename, so a commit can never point at a blob a power cut left empty.
+   */
+  adoptBlob(project: string, tmp: string, hash: Hash, size: number, synced = false) {
+    const file = this.blobPath(project, hash)
+    if (existsSync(file)) return void rmSync(tmp, { force: true })
+    if (!synced) {
+      const fd = openSync(tmp, 'r+')
+      try {
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+    }
+    mkdirSync(dirname(file), { recursive: true })
+    renameSync(tmp, file)
+    syncDir(dirname(file))
+    this.run('insert or ignore into blobs (project, hash, size) values (?, ?, ?)', project, hash, size)
   }
 
   /** Applies a batch in order. Returns per-op results and the events to broadcast. */
@@ -217,7 +267,8 @@ export class Store {
         if (r.head) events.push({ type: 'change', head: r.head })
         if (r.conflict) events.push({ type: 'conflict', conflict: r.conflict })
       } catch (e) {
-        results.push({ status: 'error', version: 0, hash: null, error: (e as Error).message })
+        if (e instanceof Busy) results.push({ status: 'busy', version: 0, hash: null, error: e.message })
+        else results.push({ status: 'error', version: 0, hash: null, error: (e as Error).message })
       }
     }
     return { results, events }
@@ -267,13 +318,22 @@ export class Store {
   /** Three-way text merge. undefined = must become a conflict (binary, delete vs edit, overlap). */
   private merge(project: string, base: Hash | null, ours: Hash | null, theirs: Hash | null): Hash | undefined {
     if (ours === null || theirs === null) return undefined
+    // Merges run on the one thread every client shares, so their CPU time is rationed.
+    const now = Date.now()
+    this.mergeDebt = Math.max(0, this.mergeDebt - (now - this.debtAt) / 2)
+    this.debtAt = now
+    if (this.mergeDebt > MERGE_BURST_MS) throw new Busy('server is busy merging; retry shortly')
     try {
       const [o, a, b] = [base, ours, theirs].map(h => (h === null ? new Uint8Array() : this.readBlob(project, h)))
       if (![o, a, b].every(isText)) return undefined
-      const r = merge3(decode(o), decode(a), decode(b))
+      const texts = [o, a, b].map(decode)
+      if (texts.reduce((n, t) => n + lineCount(t), 0) > MAX_MERGE_LINES) return undefined
+      const r = merge3(texts[0], texts[1], texts[2])
       return r.conflicts ? undefined : this.putBlob(project, Buffer.from(r.text))
     } catch {
       return undefined // unknown base or a diff too big to trust: keep both
+    } finally {
+      this.mergeDebt += Date.now() - now
     }
   }
 
@@ -336,6 +396,24 @@ export class Store {
     if (c.status !== 'open') throw Object.assign(new Error('conflict already resolved'), { status: 409 })
     return c
   }
+}
+
+function lineCount(s: string) {
+  let n = 0
+  for (let i = s.indexOf('\n'); i >= 0; i = s.indexOf('\n', i + 1)) n++
+  return n
+}
+
+/** Makes a rename durable: the directory entry itself is flushed. */
+function syncDir(dir: string) {
+  try {
+    const fd = openSync(dir, 'r')
+    try {
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+  } catch {} // not supported on every platform; the file itself is already flushed
 }
 
 function checkOp(o: unknown): Op {

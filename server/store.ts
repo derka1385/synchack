@@ -4,7 +4,7 @@
 
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { randomBytes, randomInt } from 'node:crypto'
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, cpSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { HASH_RE, sha256, type Conflict, type Hash, type Head, type Op, type OpResult, type ServerMsg } from '../shared/protocol.ts'
 import { cleanPath } from '../shared/paths.ts'
@@ -55,7 +55,6 @@ export class Store {
   constructor(dir: string, { quota = 5 * 1024 ** 3 } = {}) {
     this.dir = dir
     this.quota = quota
-    rmSync(join(dir, 'blobs', 'tmp'), { recursive: true, force: true }) // uploads cut off by a restart
     mkdirSync(join(dir, 'blobs'), { recursive: true })
     this.db = new DatabaseSync(join(dir, 'server.db'))
     this.db.exec(SCHEMA)
@@ -349,6 +348,18 @@ export class Store {
     )
     this.run('insert into versions (project, path, version, hash, device, author, op, at) values (?, ?, ?, ?, ?, ?, ?, ?)', m.project, path, h.version, hash, m.device, h.author, op, h.at)
     return h
+  }
+
+  /**
+   * A consistent copy of everything in `dest` (which must not exist): a snapshot of the
+   * database, then the blobs. Blobs are written before the commits that use them and never
+   * deleted, so every blob the snapshot refers to is already there when they are copied.
+   */
+  backup(dest: string) {
+    if (existsSync(dest)) throw new Error(`${dest} already exists`)
+    mkdirSync(dest, { recursive: true })
+    this.db.prepare('vacuum into ?').run(join(dest, 'server.db'))
+    cpSync(join(this.dir, 'blobs'), join(dest, 'blobs'), { recursive: true, filter: src => !src.startsWith(join(this.dir, 'blobs', 'tmp')) })
   }
 
   // ── conflicts ───────────────────────────────────────────────────────────

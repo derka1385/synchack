@@ -11,6 +11,7 @@ import { call, createProject, joinProject } from './engine.ts'
 import { Hub, alive, conflictText, freeFolder, inviteFor, keepLocal, parseInvite, refreshInvite, removeMember } from './hub.ts'
 import { runTui } from './tui.ts'
 import { hostIdentity } from './net.ts'
+import { Store } from '../server/store.ts'
 
 const HELP = `synchack: keep one project folder in sync across your team's Macs
 
@@ -30,6 +31,7 @@ const HELP = `synchack: keep one project folder in sync across your team's Macs
   synchack members [dir]                list teammates
   synchack remove NAME|DEVICE [dir]     remove a teammate (creator only; also replaces the invite)
   synchack leave [dir]                  stop being a member of the project (files stay)
+  synchack backup DEST                  copy everything this Mac hosts (all versions) to DEST
 
   --server URL   use that server instead of hosting projects on this Mac (or $SYNCHACK_SERVER)
   --user NAME    how teammates see you (remembered)
@@ -188,6 +190,15 @@ async function main() {
       const p = here(args[0])
       await removeMember(state, p, state.device)
       return console.log(`Left "${p.name}". The files in ${p.root} stay; they no longer sync.`)
+    }
+    case 'backup': {
+      if (!args[0]) die('usage: synchack backup DEST')
+      const data = join(state.home, 'server')
+      if (!existsSync(join(data, 'server.db'))) die('this Mac hosts no projects')
+      const store = new Store(data)
+      store.backup(resolve(args[0]))
+      store.db.close()
+      return console.log(`Backed up every project hosted here, with full history, to ${resolve(args[0])}`)
     }
     case 'open':
       return void spawn('open', [here(args[0]).root], { stdio: 'ignore', detached: true }).unref()

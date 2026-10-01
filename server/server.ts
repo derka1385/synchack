@@ -1,13 +1,13 @@
 // HTTP for commands and blobs, one WebSocket per client for pushed events.
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createServer as createTlsServer } from 'node:https'
-import { createHash as hashOf, X509Certificate } from 'node:crypto'
+import { createHash, X509Certificate } from 'node:crypto'
 import { createReadStream, readFileSync, rmSync } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { pipeline } from 'node:stream/promises'
-import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 import type { AddressInfo } from 'node:net'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { HASH_RE, MAX_FILE, lanAddresses, type Member, type ServerMsg } from '../shared/protocol.ts'
@@ -50,8 +50,9 @@ const MAX_UPLOADS = 16 // blob uploads in flight at once, across all clients
 const MAX_JSON = 2 * 1024 * 1024 // 1000 ops is about 300 KB
 
 export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 }, quota, log = () => {}, tls }: ServerOptions = {}): Promise<Server> {
-  const pin = tls && hashOf('sha256').update(new X509Certificate(tls.cert).publicKey.export({ type: 'spki', format: 'der' })).digest('base64')
+  const pin = tls && createHash('sha256').update(new X509Certificate(tls.cert).publicKey.export({ type: 'spki', format: 'der' })).digest('base64')
   const store = new Store(dataDir, { quota })
+  rmSync(join(dataDir, 'blobs', 'tmp'), { recursive: true, force: true }) // uploads cut off by a restart
   let uploads = 0
   const limiter = new RateLimit(rateLimit.max, rateLimit.windowMs)
   const rooms = new Map<string, Map<WebSocket, { me: Device; alive: boolean }>>()
@@ -363,7 +364,12 @@ async function body(req: IncomingMessage, limit: number) {
   return Buffer.concat(chunks)
 }
 
+/**
+ * JSON bodies must say so. A web page can send a cross-site POST only as a "simple" request,
+ * which cannot carry this content type, so pages the host visits can't join or create projects.
+ */
 async function json(req: IncomingMessage) {
+  if (!/^application\/json\b/i.test(req.headers['content-type'] ?? '')) throw new HttpError(415, 'expected content-type: application/json')
   const v = JSON.parse((await body(req, MAX_JSON)).toString() || '{}')
   if (!v || typeof v !== 'object') throw new HttpError(400, 'expected a JSON object')
   return v as Record<string, any>

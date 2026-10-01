@@ -205,3 +205,27 @@ test('requests are logged without secrets; unexpected errors are hidden from cal
   assert.ok(lines.some(l => l.includes('disk on fire')), 'the real error is in the log')
   assert.ok(!lines.join('\n').includes(alice.token), 'tokens never reach the log')
 })
+
+test('cross-site form posts are refused: JSON routes require a JSON content type', async t => {
+  const x = await server()
+  t.after(() => x.close())
+  const res = await fetch(`${x.s.url}/api/projects`, { method: 'POST', headers: { 'content-type': 'text/plain' }, body: JSON.stringify({ name: 'x', ...x.me('a') }) })
+  assert.equal(res.status, 415)
+})
+
+test('backup: a live copy that a server can start from', async t => {
+  const x = await server()
+  t.after(() => x.close())
+  const { alice, p } = await seeded(x, { 'a.txt': 'kept\n' })
+  const dest = join(x.s.store.dir, '..', `backup-${Date.now()}`)
+  x.s.store.backup(dest)
+  const restored = await startServer({ port: 0, dataDir: dest })
+  t.after(async () => {
+    await restored.close()
+    rmSync(dest, { recursive: true, force: true })
+  })
+  const heads = (await x.api('GET', `${p}/heads`, undefined, alice.token, restored.url)).body.heads
+  assert.deepEqual(heads.map((h: { path: string }) => h.path), ['a.txt'])
+  const blob = await fetch(`${restored.url}${p}/blobs/${heads[0].hash}`, { headers: { authorization: `Bearer ${alice.token}` } })
+  assert.equal(await blob.text(), 'kept\n')
+})

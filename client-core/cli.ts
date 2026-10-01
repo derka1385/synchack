@@ -3,12 +3,12 @@
 import { existsSync, readdirSync, realpathSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join, relative, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
 import { type Candidate, type Conflict, type Member, type Mode } from '../shared/protocol.ts'
 import { LocalState, type Project } from './state.ts'
 import { call, createProject, joinProject } from './engine.ts'
-import { Hub, alive, conflictText, freeFolder, inviteFor, keepLocal, parseInvite, refreshInvite, removeMember } from './hub.ts'
+import { Hub, alive, conflictText, freeFolder, inviteFor, keepLocal, parseInvite, refreshInvite, removeMember, restore } from './hub.ts'
 import { runTui } from './tui.ts'
 import { hostIdentity } from './net.ts'
 import { Store } from '../server/store.ts'
@@ -32,6 +32,9 @@ const HELP = `synchack: keep one project folder in sync across your team's Macs
   synchack remove NAME|DEVICE [dir]     remove a teammate (creator only; also replaces the invite)
   synchack leave [dir]                  stop being a member of the project (files stay)
   synchack backup DEST                  copy everything this Mac hosts (all versions) to DEST
+  synchack restore [PATH] [--version N] bring back files missing here (all, or under PATH);
+                                        --version N writes that version of one file (--force to replace it)
+  synchack history PATH                 list a file's versions
 
   --server URL   use that server instead of hosting projects on this Mac (or $SYNCHACK_SERVER)
   --user NAME    how teammates see you (remembered)
@@ -41,7 +44,7 @@ const HELP = `synchack: keep one project folder in sync across your team's Macs
 
 const { values: opt, positionals } = parseArgs({
   allowPositionals: true,
-  options: { server: { type: 'string' }, name: { type: 'string' }, user: { type: 'string' }, force: { type: 'boolean' }, new: { type: 'boolean' }, help: { type: 'boolean', short: 'h' } },
+  options: { server: { type: 'string' }, name: { type: 'string' }, user: { type: 'string' }, force: { type: 'boolean' }, new: { type: 'boolean' }, version: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
 })
 const [cmd, ...args] = positionals
 const state = new LocalState(process.env.SYNCHACK_HOME ?? join(homedir(), 'Library', 'Application Support', 'SyncHack'))
@@ -199,6 +202,24 @@ async function main() {
       store.backup(resolve(args[0]))
       store.db.close()
       return console.log(`Backed up every project hosted here, with full history, to ${resolve(args[0])}`)
+    }
+    case 'restore':
+    case 'history': {
+      const p = here()
+      const rel = (path: string) => relative(p.root, real(path)).split(sep).join('/')
+      if (cmd === 'history') {
+        if (!args[0]) die('usage: synchack history PATH')
+        const { versions } = await call(p, 'GET', `/history?path=${encodeURIComponent(rel(args[0]))}`)
+        if (!versions.length) return console.log('No versions on the server.')
+        for (const v of versions) console.log(`v${v.version}  ${new Date(v.at).toLocaleString()}  ${v.author ?? '?'}${v.hash ? '' : '  (deleted)'}`)
+        return
+      }
+      const version = opt.version === undefined ? undefined : Number(opt.version.replace(/^v/, ''))
+      if (version !== undefined && (!Number.isInteger(version) || !args[0])) die('usage: synchack restore PATH --version N   (see: synchack history PATH)')
+      const done = await restore(p, args[0] ? rel(args[0]) : '', { version, force: opt.force })
+      if (!done.length) return console.log('Nothing to restore: no files are missing here.')
+      console.log(`Restored ${done.length} file(s):\n${done.map(f => `  ${f}`).join('\n')}`)
+      return console.log(daemonPid() ? 'They sync to the team as new versions.' : 'They sync to the team once synchack runs.')
     }
     case 'open':
       return void spawn('open', [here(args[0]).root], { stdio: 'ignore', detached: true }).unref()

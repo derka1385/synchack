@@ -6,8 +6,9 @@ import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { startServer } from '../server/server.ts'
 import { LocalState, type Project } from '../client-core/state.ts'
-import { ProjectSync, call, createProject, joinProject } from '../client-core/engine.ts'
+import { ProjectSync, call, createProject, joinProject, runsCode } from '../client-core/engine.ts'
 import { sha256 } from '../shared/protocol.ts'
+import { restore } from '../client-core/hub.ts'
 
 const FAST = { liveMs: 80, calmMs: 1000, reconnectMaxMs: 300 }
 const NAMES = ['Giles', 'Oliver', 'Ada', 'Lin']
@@ -423,6 +424,74 @@ test('1500 files in nested folders import and join intact', async () => {
     assert.deepEqual(tree(b.root), tree(a.root))
     for (const [path, body] of Object.entries(files)) assert.equal(read(b, path), body)
     console.log(`# 1500 files: import + join in ${Date.now() - t0} ms`)
+  } finally {
+    await t.close()
+  }
+})
+
+test('mass deletions pause sync until confirmed; restore brings files back; moves are not deletions', async () => {
+  const files = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`src/f${i}.ts`, `export const n = ${i}\n`]))
+  const t = await team(2, files)
+  const [a, b] = t.macs
+  try {
+    // Moving a big folder is 60 deletions plus 60 creations of the same content: not a mass delete.
+    renameSync(join(a.root, 'src'), join(a.root, 'lib'))
+    await until('B sees the move', () => read(b, 'lib/f59.ts') !== null && read(b, 'src/f0.ts') === null)
+    assert.equal(a.sync.mode, 'live')
+
+    rmSync(join(a.root, 'lib'), { recursive: true })
+    await until('A pauses', () => a.sync.mode === 'paused')
+    await sleep(300)
+    assert.equal(read(b, 'lib/f0.ts'), 'export const n = 0\n', 'nothing was deleted on B')
+
+    const restored = await restore(a.p, 'lib')
+    assert.equal(restored.length, 60)
+    a.sync.setMode('live')
+    await a.sync.idle()
+    await sleep(300)
+    assert.equal(tree(b.root).length, 60, 'B still has every file')
+
+    // Confirming by resuming sends the deletions.
+    rmSync(join(a.root, 'lib'), { recursive: true })
+    await until('A pauses again', () => a.sync.mode === 'paused')
+    a.sync.setMode('live')
+    await until('B loses the files', () => tree(b.root).length === 0)
+  } finally {
+    await t.close()
+  }
+})
+
+test('restore: any old version of a file, and a file deleted everywhere', async () => {
+  const t = await team(2, { 'notes.md': 'v1\n' })
+  const [a, b] = t.macs
+  try {
+    write(a.root, { 'notes.md': 'v2\n' })
+    await until('B has v2', () => read(b, 'notes.md') === 'v2\n')
+    await assert.rejects(restore(b.p, 'notes.md', { version: 1 }), /--force/)
+    await restore(b.p, 'notes.md', { version: 1, force: true })
+    await until('A gets v1 back', () => read(a, 'notes.md') === 'v1\n')
+
+    rmSync(join(a.root, 'notes.md'))
+    await until('B loses it', () => read(b, 'notes.md') === null)
+    assert.deepEqual(await restore(b.p), ['notes.md'])
+    assert.equal(read(b, 'notes.md'), 'v1\n')
+    await until('A gets it back', () => read(a, 'notes.md') === 'v1\n')
+  } finally {
+    await t.close()
+  }
+})
+
+test('changes to files that tools execute are flagged on arrival', async () => {
+  assert.ok(runsCode('.claude/settings.json') && runsCode('web/package.json') && runsCode('.github/workflows/ci.yml'))
+  assert.ok(!runsCode('src/package.json.bak') && !runsCode('docs/claude.md'))
+  const t = await team(2)
+  const [a, b] = t.macs
+  const logs: string[] = []
+  b.sync.on('log', (l: string) => logs.push(l))
+  try {
+    write(a.root, { '.claude/settings.json': '{"hooks":{}}\n', 'src/app.ts': 'x\n' })
+    await until('B has both', () => read(b, 'src/app.ts') !== null && read(b, '.claude/settings.json') !== null)
+    assert.deepEqual(logs.filter(l => l.startsWith('⚠')).map(l => l.split(' ')[1]), ['.claude/settings.json'])
   } finally {
     await t.close()
   }

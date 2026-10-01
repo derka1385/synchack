@@ -2,12 +2,13 @@
 // created here. Used by the terminal UI and by `synchack run`.
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { appendFileSync, existsSync, readdirSync, readFileSync, renameSync, statSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, sep } from 'node:path'
 import { startServer, type Server } from '../server/server.ts'
 import { lanAddresses, sha256, type Conflict, type Hash } from '../shared/protocol.ts'
 import { decode, isText, merge3 } from '../shared/merge.ts'
+import { cleanPath } from '../shared/paths.ts'
 import { ProjectSync, call, createProject, joinProject, type SyncOptions } from './engine.ts'
 import type { LocalState, Project } from './state.ts'
 import { hostIdentity, pinOf, request, urlPin } from './net.ts'
@@ -82,6 +83,50 @@ export async function removeMember(state: LocalState, p: Project, device: string
     state.setCode(p.id, invite.code)
     p.code = invite.code
   }
+}
+
+/**
+ * Brings back files missing from this Mac under `prefix` ('' = the whole project): each gets
+ * the server's current content or, if it was deleted there, its last content. With `version`,
+ * writes that version of the one file `prefix` names (replacing a local file only with `force`).
+ * Restored files are ordinary local edits: sync uploads them as new versions.
+ */
+export async function restore(p: Project, prefix = '', opts: { version?: number; force?: boolean } = {}) {
+  const root = realpathSync(p.root)
+  const under = (path: string) => !prefix || path === prefix || path.startsWith(prefix.replace(/\/$/, '') + '/')
+  const last = async (path: string, version?: number) => {
+    const { versions } = (await call(p, 'GET', `/history?path=${encodeURIComponent(path)}`)) as { versions: { version: number; hash: Hash | null }[] }
+    const v = version === undefined ? versions.findLast(v => v.hash) : versions.find(v => v.version === version)
+    if (version !== undefined && !v) throw new Error(`${path} has no version ${version}`)
+    return v?.hash ?? null
+  }
+  const write = async (path: string, hash: Hash) => {
+    const file = join(root, cleanPath(path))
+    mkdirSync(dirname(file), { recursive: true })
+    const real = realpathSync(dirname(file))
+    if (real !== root && !real.startsWith(root + sep)) throw new Error(`${path} resolves outside the project folder`)
+    const bytes = (await call(p, 'GET', `/blobs/${hash}`)) as Buffer
+    if (sha256(bytes) !== hash) throw new Error(`download of ${path} was corrupted`)
+    writeFileSync(file, bytes)
+  }
+  if (opts.version !== undefined) {
+    const path = cleanPath(prefix)
+    if (existsSync(join(root, path)) && !opts.force) throw new Error(`${path} exists on this Mac; pass --force to replace it`)
+    const hash = await last(path, opts.version)
+    if (!hash) throw new Error(`version ${opts.version} of ${path} is a deletion`)
+    await write(path, hash)
+    return [path]
+  }
+  const { heads } = (await call(p, 'GET', '/heads')) as { heads: { path: string; hash: Hash | null }[] }
+  const restored: string[] = []
+  for (const h of heads) {
+    if (!under(h.path) || existsSync(join(root, h.path))) continue
+    const hash = h.hash ?? (await last(h.path))
+    if (!hash) continue
+    await write(h.path, hash)
+    restored.push(h.path)
+  }
+  return restored
 }
 
 /** Resolves a conflict with the file as it is on this Mac now (e.g. merged by hand). */

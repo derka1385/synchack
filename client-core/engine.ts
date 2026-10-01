@@ -90,6 +90,10 @@ export async function joinProject(state: LocalState, server: string, code: strin
   return p
 }
 
+/** Files that agents, editors or shells execute or load as configuration: a change to one is worth a look. */
+const RUNS_CODE = /^(\.claude|\.vscode|\.cursor|\.husky|\.devcontainer|\.github\/workflows)\/|(^|\/)(package\.json|\.envrc|\.npmrc|Makefile|CLAUDE\.md|AGENTS\.md|\.mcp\.json)$/
+export const runsCode = (path: string) => RUNS_CODE.test(path)
+
 export interface SyncOptions {
   liveMs?: number // debounce after the last event on a file
   calmMs?: number
@@ -97,6 +101,7 @@ export interface SyncOptions {
 }
 
 const REMOVED = 4001 // WebSocket close code: this device was removed from the project
+const MASS_DELETE = 50 // files deleted in one round that pause sync (see massDelete)
 const BATCH_FILES = 500
 const BATCH_BYTES = 32 * 1024 * 1024
 
@@ -129,6 +134,8 @@ export class ProjectSync extends EventEmitter {
   private backoff = 0
   private lastMsg = 0
   private stopped = false
+  private unconfirmed: string[] = [] // deletions held by the mass-deletion guard
+  private confirmed = new Set<string>() // ...and those the user let through by resuming
   private reconnect?: NodeJS.Timeout
   private heartbeat?: NodeJS.Timeout
 
@@ -178,7 +185,15 @@ export class ProjectSync extends EventEmitter {
     this.mode = this.p.mode = mode
     this.state.setMode(this.p.id, mode)
     if (mode === 'paused') this.ws && this.drop(this.ws) // local edits pile up; reconciled on resume
-    else if (was === 'paused') this.connect()
+    else if (was === 'paused') {
+      if (this.errors.get('')?.includes('deleted at once')) {
+        this.errors.delete('')
+        // Resuming is the answer: send the deletions of whatever is still missing (not restored).
+        this.confirmed = new Set(this.unconfirmed.filter(path => !existsSync(join(this.root, path))))
+        this.unconfirmed = []
+      }
+      this.connect()
+    }
     else for (const path of [...this.timers.keys()]) this.touch(path) // re-arm with the new delay
     this.log(`mode: ${mode}`)
     this.emit('status')
@@ -363,6 +378,7 @@ export class ProjectSync extends EventEmitter {
         const opId = sha256(`${this.state.device}\n${path}\n${st.version}\n${st.hash}\n${hash}`)
         ops.push({ opId, path, baseVersion: st.version, baseHash: st.hash, hash })
       }
+      if (await this.massDelete(ops)) return
       ops.sort((x, y) => Number(x.hash !== null) - Number(y.hash !== null)) // deletes first (case-only renames)
       if (!existsSync(this.root)) return this.fail('', 'project folder is missing; sync stopped') // moved mid-flush
       try {
@@ -374,6 +390,33 @@ export class ProjectSync extends EventEmitter {
         return
       }
     }
+  }
+
+  /**
+   * An emptied folder, a branch switch or a stray `rm -r` would delete the files on every Mac.
+   * When one round deletes many files (not counting moves), pause instead and ask: resuming
+   * (`synchack live`) sends the deletions, and restoring the files cancels them.
+   */
+  private async massDelete(ops: Op[]) {
+    const tracked = this.state.tracked(this.p.id).length
+    const many = (n: number) => n >= MASS_DELETE || (n >= 10 && n > tracked / 2)
+    let gone = ops.filter(o => o.hash === null && o.baseHash !== null && !this.confirmed.has(o.path))
+    for (const op of ops) this.confirmed.delete(op.path)
+    if (!many(gone.length)) return false
+    // A moved folder shows up as deletions plus new files with the same content, maybe not in this round yet.
+    const moved = new Set(ops.map(o => o.hash))
+    for (const path of await this.walk(''))
+      if (this.state.file(this.p.id, path).hash === null) moved.add((await this.read(path).catch(() => null))?.hash ?? null)
+    gone = gone.filter(o => !moved.has(o.baseHash))
+    const deletes = gone.length
+    if (!many(deletes)) return false
+    for (const op of ops) this.ready.add(op.path)
+    this.unconfirmed = gone.map(o => o.path)
+    this.setMode('paused')
+    const msg = `${deletes} files were deleted at once, so sync is paused. To send the deletions, switch to live (synchack live); to undo them, restore the files first (synchack restore).`
+    this.errors.set('', msg)
+    this.log(msg)
+    return true
   }
 
   private async push(ops: Op[], blobs: Map<Hash, Buffer>) {
@@ -459,6 +502,7 @@ export class ProjectSync extends EventEmitter {
         this.stale.delete(path)
         this.errors.delete(path)
         if (disk !== h.hash) this.log(`↓ ${path}${h.author ? ` from ${h.author.replace(/ \(.*\)$/, '')}` : ''}`)
+        if (disk !== h.hash && h.hash !== null && runsCode(path)) this.log(`⚠ ${path} changed: tools on this Mac may run what it contains, so check it`)
         return
       }
       // Unsynced local edits: never overwrite them. Upload instead; the server merges.

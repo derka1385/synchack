@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // synchack: share a project folder with your team. Agents and editors keep using plain files.
+import { printable } from '../shared/paths.ts'
 import { existsSync, readdirSync, realpathSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
@@ -8,19 +9,21 @@ import { parseArgs } from 'node:util'
 import { type Candidate, type Conflict, type Member, type Mode } from '../shared/protocol.ts'
 import { LocalState, type Project } from './state.ts'
 import { call, createProject, joinProject } from './engine.ts'
-import { Hub, alive, conflictText, freeFolder, inviteFor, keepLocal, parseInvite, refreshInvite, removeMember, restore } from './hub.ts'
+import { Hub, alive, conflictText, freeFolder, inviteFor, keepLocal, parseInvite, previewLines, previewShare, refreshInvite, removeMember, restore } from './hub.ts'
 import { runTui } from './tui.ts'
+import { startUi } from './ui-server.ts'
 import { hostIdentity } from './net.ts'
 import { Store } from '../server/store.ts'
 
 const HELP = `synchack: keep one project folder in sync across your team's Macs
 
-  synchack                              open the terminal interface (share, join, see who edits what)
+  synchack [--no-browser] [--no-discover]  open synchack: the app in your browser, plus the terminal view
   synchack create [dir] [--name NAME]   share a folder (existing files are imported) and print the invite
-  synchack join INVITE [dir]            join with an invite like HX7-K92@192.168.1.129:8787#k3Jq…
+  synchack join INVITE [dir]            join with an invite like HX7K-92QM@192.168.1.129:8787#k3Jq…
                                         (the folder defaults to ~/<project name>)
   synchack run                          keep every project on this Mac in sync, without the interface
   synchack status                       projects, sync state, teammates, open conflicts
+  synchack stop                         stop synchack on this Mac (also /endsynchack); files stay as they are
   synchack live | calm | pause [dir]    live ≈0.4 s · calm: batches after 15 s quiet · pause: nothing in or out
   synchack conflicts [dir]              list open conflicts
   synchack show ID [dir]                print both versions with conflict markers
@@ -38,19 +41,22 @@ const HELP = `synchack: keep one project folder in sync across your team's Macs
 
   --server URL   use that server instead of hosting projects on this Mac (or $SYNCHACK_SERVER)
   --user NAME    how teammates see you (remembered)
+  --no-discover  don't announce this Mac on the Wi-Fi or list others (or $SYNCHACK_DISCOVER=0);
+                 teammates then join with the invite text only
   $SYNCHACK_HOME holds this Mac's sync state (default ~/Library/Application Support/SyncHack)
   $SYNCHACK_PORT is the port this Mac hosts on (default 8787)
 `
 
 const { values: opt, positionals } = parseArgs({
   allowPositionals: true,
-  options: { server: { type: 'string' }, name: { type: 'string' }, user: { type: 'string' }, force: { type: 'boolean' }, new: { type: 'boolean' }, version: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
+  options: { server: { type: 'string' }, name: { type: 'string' }, user: { type: 'string' }, force: { type: 'boolean' }, new: { type: 'boolean' }, version: { type: 'string' }, help: { type: 'boolean', short: 'h' }, 'no-browser': { type: 'boolean' }, 'no-discover': { type: 'boolean' } },
 })
 const [cmd, ...args] = positionals
 const state = new LocalState(process.env.SYNCHACK_HOME ?? join(homedir(), 'Library', 'Application Support', 'SyncHack'))
 if (opt.user) state.setMeta('user', opt.user)
 const explicitServer = (opt.server ?? process.env.SYNCHACK_SERVER)?.replace(/\/+$/, '')
 const port = Number(process.env.SYNCHACK_PORT) || undefined // where this Mac hosts (default 8787)
+const discover = !opt['no-discover'] && process.env.SYNCHACK_DISCOVER !== '0' // Bonjour on the local network
 const time = () => new Date().toLocaleTimeString()
 
 function die(msg: string): never {
@@ -68,21 +74,29 @@ function daemonPid() {
 
 /** Syncs every project here (and hosts the ones created here) until Ctrl-C, logging to the terminal. */
 async function foreground(work?: (hub: Hub) => Promise<unknown>) {
-  const hub = new Hub(state, { server: explicitServer, port })
+  const hub = new Hub(state, { server: explicitServer, port, discover })
   hub.on('log', (p: Project, line: string) => console.log(`${time()} [${p.name}] ${line}`))
   await hub.start().catch(e => die(e.message))
   if (hub.hostError) console.log(hub.hostError)
   await work?.(hub)
   console.log(`syncing ${hub.engines.size} project(s); Ctrl-C to stop`)
-  const quit = () => hub.close().then(() => process.exit(0))
-  process.once('SIGINT', quit)
-  process.once('SIGTERM', quit)
+  onQuit(() => hub.close())
+}
+
+/** Ctrl-C, `synchack stop` and a closed Terminal window all shut down cleanly (or give up after 3 s). */
+function onQuit(close: () => Promise<unknown>) {
+  const quit = () => {
+    setTimeout(() => process.exit(0), 3000).unref()
+    close().finally(() => process.exit(0))
+  }
+  // .on, not .once: Ink re-raises a signal (killing us mid-close) when it sees no other listener
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, quit)
 }
 
 function printConflict(c: Conflict) {
   const tally = (x: 'A' | 'B') => Object.values(c.votes).filter(v => v === x).length
-  const side = (x: Candidate) => `${x.author ?? 'unknown'}, ${new Date(x.at).toLocaleTimeString()}${x.hash === null ? ' (deleted the file)' : ''}`
-  console.log(`${c.id}  ${c.path}\n  A: ${side(c.a)}\n  B: ${side(c.b)}\n  votes: A ${tally('A')} · B ${tally('B')}\n`)
+  const side = (x: Candidate) => `${printable(x.author ?? 'unknown')}, ${new Date(x.at).toLocaleTimeString()}${x.hash === null ? ' (deleted the file)' : ''}`
+  console.log(`${printable(c.id)}  ${printable(c.path)}\n  A: ${side(c.a)}\n  B: ${side(c.b)}\n  votes: A ${tally('A')} · B ${tally('B')}\n`)
 }
 
 const shared = (p: Project) => console.log(`Sharing "${p.name}" from ${p.root}\n\n  invite: ${inviteFor(p)}\n\nTeammates run:  synchack join ${inviteFor(p)}\n`)
@@ -91,13 +105,27 @@ async function main() {
   switch (cmd) {
     case undefined: {
       if (!process.stdout.isTTY || opt.help) return console.log(HELP)
-      const hub = new Hub(state, { server: explicitServer, port })
+      const hub = new Hub(state, { server: explicitServer, port, discover })
       await hub.start().catch(e => die(e.message))
-      await runTui(hub)
+      const ui = await startUi(hub) // the browser interface; the terminal one runs alongside
+      onQuit(() => hub.close())
+      if (!opt['no-browser']) spawn('open', [ui.url], { stdio: 'ignore', detached: true }).unref()
+      await runTui(hub, ui.url) // also returns when the window is closed
+      await hub.close()
       return process.exit(0)
+    }
+    case 'stop': {
+      const pid = daemonPid()
+      state.setMeta('daemon', '')
+      if (!pid) return console.log('synchack is not running.')
+      process.kill(pid, 'SIGTERM')
+      for (let i = 0; i < 50 && alive(pid); i++) await new Promise(r => setTimeout(r, 100))
+      if (alive(pid)) process.kill(pid, 'SIGKILL')
+      return console.log(`Stopped synchack (pid ${pid}). Your files stay as they are; run synchack to start again.`)
     }
     case 'create': {
       const dir = resolve(args[0] ?? '.')
+      if (existsSync(dir)) for (const [, line] of previewLines(previewShare(dir))) console.log(`  ${line}`)
       const pid = daemonPid()
       if (!pid) return foreground(async hub => shared(await hub.create(dir, opt.name)))
       // A running synchack hosts on this Mac; it picks the new project up within a second.

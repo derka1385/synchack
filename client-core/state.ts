@@ -1,6 +1,6 @@
 // Local persistent state (one SQLite file per device, shared by all its projects).
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
-import { mkdirSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { hostname, userInfo } from 'node:os'
 import { join, sep } from 'node:path'
@@ -30,8 +30,11 @@ export class LocalState {
 
   constructor(home: string) {
     this.home = home
-    mkdirSync(home, { recursive: true })
+    // holds project tokens: this user only (a Mac can have other accounts)
+    mkdirSync(home, { recursive: true, mode: 0o700 })
+    chmodSync(home, 0o700)
     this.db = new DatabaseSync(join(home, 'state.db'))
+    for (const f of ['state.db', 'state.db-wal', 'state.db-shm']) if (existsSync(join(home, f))) chmodSync(join(home, f), 0o600)
     this.db.exec(`
       pragma journal_mode = wal;
       pragma busy_timeout = 5000;

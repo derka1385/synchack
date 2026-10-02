@@ -9,12 +9,13 @@
 // Remote events older than the row's version are ignored, so duplicates are harmless.
 
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, watch, writeFileSync, type FSWatcher } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs'
 import { link, lstat, mkdir, readdir, readFile, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, sep } from 'node:path'
+import { homedir } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import { MAX_FILE, sha256, type Conflict, type Hash, type Head, type Member, type Mode, type Op, type OpResult, type ServerMsg } from '../shared/protocol.ts'
-import { cleanPath, ignoreRules, type Ignore } from '../shared/paths.ts'
+import { cleanPath, ignoreRules, printable, type Ignore } from '../shared/paths.ts'
 import type { LocalState, Project } from './state.ts'
 import { WebSocket, type ClientOptions } from 'ws'
 import { ConnectError, pinnedCert, request, trust, type Peer } from './net.ts'
@@ -57,9 +58,32 @@ async function post(peer: Peer, path: string, body: unknown, token?: string) {
   return data
 }
 
+/** Folders whose sharing would publish a whole Mac's worth of files (and its keys). */
+const SYSTEM = ['/', '/Users', '/System', '/Library', '/Applications', '/usr', '/bin', '/sbin', '/etc', '/var', '/private', '/private/var', '/private/etc', '/private/tmp', '/tmp', '/opt', '/Volumes', '/cores']
+
+/** Throws unless `root` (a real path) is a reasonable project folder to share or join into. */
+export function refuseRoot(root: string, stateHome?: string) {
+  const home = (() => {
+    try {
+      return realpathSync(homedir())
+    } catch {
+      return homedir()
+    }
+  })()
+  const within = (a: string, b: string) => a === b || a.startsWith(b + sep)
+  const why =
+    SYSTEM.includes(root) ? 'a system folder'
+    : within(home, root) ? 'your home folder (or a folder containing it)'
+    : within(root, join(home, 'Library')) ? 'inside ~/Library'
+    : stateHome && (within(root, stateHome) || within(stateHome, root)) ? "synchack's own data (it holds your access tokens)"
+    : ''
+  if (why) throw new Error(`can't share ${root}: it is ${why}, not a project folder. Pick the project's own folder.`)
+}
+
 function claim(state: LocalState, dir: string) {
   mkdirSync(dir, { recursive: true })
   const root = realpathSync(dir)
+  refuseRoot(root, realpathSync(state.home))
   const clash = state.projects().find(p => root === p.root || root.startsWith(p.root + sep) || p.root.startsWith(root + sep))
   if (clash) throw new Error(`${root} overlaps the shared folder ${clash.root}`)
   return root
@@ -91,7 +115,7 @@ export async function joinProject(state: LocalState, server: string, code: strin
 }
 
 /** Files that agents, editors or shells execute or load as configuration: a change to one is worth a look. */
-const RUNS_CODE = /^(\.claude|\.vscode|\.cursor|\.husky|\.devcontainer|\.github\/workflows)\/|(^|\/)(package\.json|\.envrc|\.npmrc|Makefile|CLAUDE\.md|AGENTS\.md|\.mcp\.json)$/
+const RUNS_CODE = /^(\.claude|\.codex|\.vscode|\.cursor|\.zed|\.idea|\.windsurf|\.husky|\.devcontainer|\.github\/workflows)\/|(^|\/)(package\.json|\.envrc|\.npmrc|Makefile|justfile|CLAUDE\.md|AGENTS\.md|\.mcp\.json|pyproject\.toml|setup\.py|build\.rs|[^/]+\.command)$/i
 export const runsCode = (path: string) => RUNS_CODE.test(path)
 
 export interface SyncOptions {
@@ -102,6 +126,14 @@ export interface SyncOptions {
 
 const REMOVED = 4001 // WebSocket close code: this device was removed from the project
 const MASS_DELETE = 50 // files deleted in one round that pause sync (see massDelete)
+
+export interface Edit {
+  device: string
+  author: string | null
+  at: number
+  deleted: boolean
+}
+
 const BATCH_FILES = 500
 const BATCH_BYTES = 32 * 1024 * 1024
 
@@ -116,8 +148,13 @@ export class ProjectSync extends EventEmitter {
   conflicts = new Map<string, Conflict>()
   errors = new Map<string, string>()
   stats = { ops: 0, uploads: 0, downloads: 0, lastSync: 0 }
-  /** Last change to each path, by whom: shows who is working on which file. */
-  activity = new Map<string, { device: string; author: string | null; at: number; deleted: boolean }>()
+  /** Recent changes to each path, newest first: who is working on which file. */
+  activity = new Map<string, Edit[]>()
+  /**
+   * Changes from teammates worth a look before running anything: files that tools execute or
+   * load as configuration, and the shared sync rules. Shown in the app until dismissed.
+   */
+  flagged = new Map<string, { at: number; author: string | null; why: string }>()
 
   private ignored: Ignore = ignoreRules()
   private ignoreText?: string
@@ -150,7 +187,10 @@ export class ProjectSync extends EventEmitter {
 
   start() {
     const meta = join(this.root, '.synchack')
+    for (const d of [meta, join(meta, 'tmp'), join(meta, 'trash')])
+      if (existsSync(d) && lstatSync(d).isSymbolicLink()) throw new Error(`${d} is a symlink; synchack won't use it (move it away and start again)`)
     rmSync(join(meta, 'tmp'), { recursive: true, force: true })
+    this.emptyTrash(join(meta, 'trash'))
     mkdirSync(join(meta, 'tmp'), { recursive: true })
     writeFileSync(join(meta, '.gitignore'), '*\n') // keeps our temp files out of git
     this.loadIgnore()
@@ -250,9 +290,18 @@ export class ProjectSync extends EventEmitter {
       text = readFileSync(join(this.root, '.synchackignore'), 'utf8')
     } catch {}
     if (text === this.ignoreText) return
+    const before = this.ignored
     this.ignoreText = text
     this.ignored = ignoreRules(text)
     if (!this.watcher) return
+    // The rules are shared: a teammate can make files stop syncing for everyone. Say so.
+    const hidden = this.state.tracked(this.p.id).filter(f => this.ignored(f) && !before(f)).length
+    if (hidden) {
+      this.log(`⚠ the shared sync rules (.synchackignore) changed: ${hidden} file${hidden > 1 ? 's' : ''} no longer sync`)
+      // a teammate's rules wait for review; ours (edited here, not uploaded yet) don't
+      if (sha256(text) === this.state.file(this.p.id, '.synchackignore').hash)
+        this.flag('.synchackignore', this.activity.get('.synchackignore')?.[0]?.author ?? null, `${hidden} file${hidden > 1 ? 's' : ''} no longer sync`)
+    }
     // Files the new rules stop ignoring: ours to upload, and the server's, which we skipped
     // while still ignoring them (they can arrive before the new .synchackignore does).
     this.rescan()
@@ -331,8 +380,11 @@ export class ProjectSync extends EventEmitter {
       const st = await lstat(abs)
       if (!st.isFile()) return null
       if (st.size > MAX_FILE) throw new Error('larger than 100 MB, not synced')
+      const real = await realpath(abs)
+      // a folder on the way is a symlink out of the project: never read (and upload) what it points at
+      if (!real.startsWith(this.root + sep)) throw new Error('resolves outside the project folder (symlinked folder); not synced')
       // APFS ignores case: "readme.md" must not be read through a file named "README.md"
-      if (basename(await realpath(abs)).normalize('NFC') !== basename(path)) return null
+      if (basename(real).normalize('NFC') !== basename(path)) return null
       const bytes = await readFile(abs)
       const hash = sha256(bytes)
       this.scanned.set(path, { size: st.size, mtimeMs: st.mtimeMs, hash }) // stat taken before the read
@@ -451,7 +503,7 @@ export class ProjectSync extends EventEmitter {
       }
       this.state.setFile(this.p.id, path, r.version, r.hash)
       this.errors.delete(path)
-      if (op.hash !== op.baseHash) this.log(`${r.status === 'merged' ? 'merged' : '↑'} ${path} (v${r.version})`)
+      if (op.hash !== op.baseHash) this.log(op.hash === null ? `deleted ${path} (v${r.version}, kept in history)` : `${r.status === 'merged' ? 'merged' : '↑'} ${path} (v${r.version})`)
     } else if (r.status === 'conflict') {
       // The server keeps our content as candidate B; this file keeps it locally too.
       this.state.setFile(this.p.id, path, r.version, op.hash)
@@ -502,7 +554,10 @@ export class ProjectSync extends EventEmitter {
         this.stale.delete(path)
         this.errors.delete(path)
         if (disk !== h.hash) this.log(`↓ ${path}${h.author ? ` from ${h.author.replace(/ \(.*\)$/, '')}` : ''}`)
-        if (disk !== h.hash && h.hash !== null && runsCode(path)) this.log(`⚠ ${path} changed: tools on this Mac may run what it contains, so check it`)
+        if (disk !== h.hash && h.hash !== null && runsCode(path)) {
+          this.log(`⚠ ${path} changed: tools on this Mac may run what it contains, so check it`)
+          this.flag(path, h.author, 'tools on this Mac may run what it contains')
+        }
         return
       }
       // Unsynced local edits: never overwrite them. Upload instead; the server merges.
@@ -522,7 +577,13 @@ export class ProjectSync extends EventEmitter {
     const now = async () => (await this.read(path))?.hash ?? null
     if (bytes === null) {
       if ((await now()) !== expect) return false
-      await rm(abs, { force: true })
+      // into .synchack/trash/<day>/ rather than gone: a teammate (or a compromised host) deleting
+      // everything can't destroy this Mac's copies; kept 7 days
+      const day = new Date().toISOString().slice(0, 10)
+      let dest = join(this.root, '.synchack', 'trash', day, path)
+      if (existsSync(dest)) dest += `.${Date.now()}`
+      await mkdir(dirname(dest), { recursive: true })
+      await rename(abs, dest).catch(e => (e.code === 'ENOENT' ? undefined : Promise.reject(e)))
       await this.prune(path)
       return true
     }
@@ -577,8 +638,9 @@ export class ProjectSync extends EventEmitter {
 
   private connect() {
     if (this.stopped || this.ws || this.mode === 'paused') return
-    const url = `${this.p.server.replace(/^http/, 'ws')}/api/p/${this.p.id}/ws?token=${encodeURIComponent(this.p.token)}&since=${this.p.seq}`
-    const ws = new WebSocket(url, { ...(trust(this.p.cert) as ClientOptions), maxPayload: 256 * 1024 * 1024 })
+    // the token goes in a header: URLs end up in proxy and server access logs
+    const url = `${this.p.server.replace(/^http/, 'ws')}/api/p/${this.p.id}/ws?since=${this.p.seq}`
+    const ws = new WebSocket(url, { ...(trust(this.p.cert) as ClientOptions), maxPayload: 256 * 1024 * 1024, headers: { authorization: `Bearer ${this.p.token}` } })
     this.ws = ws
     this.lastMsg = Date.now()
     ws.onmessage = e => {
@@ -617,8 +679,8 @@ export class ProjectSync extends EventEmitter {
     if (ws !== this.ws) return // from a socket we already dropped
     try {
       if (msg.type === 'hello') {
-        this.members = msg.members
-        this.conflicts = new Map(msg.conflicts.map(c => [c.id, c]))
+        this.members = msg.members.map(safeMember)
+        this.conflicts = new Map(msg.conflicts.map(c => [c.id, safeConflict(c)]))
         this.blocked = new Set(msg.conflicts.map(c => c.path))
         this.log(msg.heads.length ? `connected; catching up on ${msg.heads.length} remote change(s)` : 'connected')
         await this.pull(msg.heads)
@@ -632,7 +694,7 @@ export class ProjectSync extends EventEmitter {
         await this.pull([msg.head])
         if (msg.head.seq > this.p.seq) this.setSeq(msg.head.seq)
       } else if (msg.type === 'conflict') this.onConflict(msg.conflict)
-      else if (msg.type === 'members') this.members = msg.members
+      else if (msg.type === 'members') this.members = msg.members.map(safeMember)
       this.emit('status')
     } catch (e) {
       // Unapplied events must not be skipped: reconnect and catch up from the last good seq.
@@ -641,7 +703,8 @@ export class ProjectSync extends EventEmitter {
     }
   }
 
-  private onConflict(c: Conflict) {
+  private onConflict(raw: Conflict) {
+    const c = safeConflict(raw)
     const known = this.conflicts.has(c.id)
     if (c.status === 'open') {
       this.conflicts.set(c.id, c)
@@ -664,7 +727,8 @@ export class ProjectSync extends EventEmitter {
 
   private note(h: Head) {
     if (!h.device) return
-    this.activity.set(h.path, { device: h.device, author: h.author, at: h.at, deleted: h.hash === null })
+    const seen = (this.activity.get(h.path) ?? []).filter(e => e.at !== h.at || e.device !== h.device)
+    this.activity.set(h.path, [{ device: h.device, author: h.author, at: h.at, deleted: h.hash === null }, ...seen].slice(0, 5))
     this.emit('activity')
   }
 
@@ -680,7 +744,20 @@ export class ProjectSync extends EventEmitter {
   }
 
   private log(line: string) {
-    this.emit('log', line)
+    this.emit('log', printable(line)) // paths and names come from teammates: no terminal escapes
+  }
+
+  private flag(path: string, author: string | null, why: string) {
+    this.flagged.set(path, { at: Date.now(), author: author && printable(author), why })
+    if (this.flagged.size > 50) this.flagged.delete(this.flagged.keys().next().value!)
+    this.emit('status')
+  }
+
+  private emptyTrash(trash: string) {
+    const cutoff = Date.now() - 7 * 86_400_000
+    try {
+      for (const day of readdirSync(trash)) if (statSync(join(trash, day)).mtimeMs < cutoff) rmSync(join(trash, day), { recursive: true, force: true })
+    } catch {} // no trash yet
   }
 }
 
@@ -690,3 +767,11 @@ async function pool<T>(items: T[], n: number, fn: (item: T) => Promise<void>) {
     for (const x of it) await fn(x)
   }))
 }
+
+const safeMember = (m: Member): Member => ({ ...m, name: printable(String(m.name)), deviceName: printable(String(m.deviceName)) })
+const safeConflict = (c: Conflict): Conflict => ({
+  ...c,
+  a: { ...c.a, author: c.a.author && printable(c.a.author) },
+  b: { ...c.b, author: c.b.author && printable(c.b.author) },
+  resolvedBy: c.resolvedBy && printable(c.resolvedBy),
+})

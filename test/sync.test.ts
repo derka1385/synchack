@@ -124,8 +124,7 @@ test('imports an existing folder; a teammate joins; edits flow both ways; ignore
 
     write(b.root, { '.env': 'SECRET=oliver\n' }) // each Mac keeps its own secrets
     write(a.root, { '.synchackignore': 'scratch/\n!.env.example\n', '.env.example': 'SECRET=\n', 'scratch/notes.txt': 'mine\n' })
-    await until('B gets the re-included .env.example', () => read(b, '.env.example') === 'SECRET=\n')
-    assert.equal(read(b, '.synchackignore'), 'scratch/\n!.env.example\n')
+    await until('B gets the rules and .env.example (same round, either order)', () => read(b, '.env.example') === 'SECRET=\n' && read(b, '.synchackignore') === 'scratch/\n!.env.example\n')
     assert.equal(read(b, 'scratch/notes.txt'), null)
     assert.equal(read(a, '.env'), 'SECRET=giles\n')
     assert.equal(read(b, '.env'), 'SECRET=oliver\n')
@@ -483,7 +482,9 @@ test('restore: any old version of a file, and a file deleted everywhere', async 
 
 test('changes to files that tools execute are flagged on arrival', async () => {
   assert.ok(runsCode('.claude/settings.json') && runsCode('web/package.json') && runsCode('.github/workflows/ci.yml'))
-  assert.ok(!runsCode('src/package.json.bak') && !runsCode('docs/claude.md'))
+  assert.ok(!runsCode('src/package.json.bak') && !runsCode('docs/claude-notes.md'))
+  // APFS ignores case: docs/claude.md is the docs/CLAUDE.md agents read, .CLAUDE/ is .claude/
+  assert.ok(runsCode('docs/claude.md') && runsCode('.CLAUDE/settings.json'))
   const t = await team(2)
   const [a, b] = t.macs
   const logs: string[] = []

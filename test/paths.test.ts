@@ -12,9 +12,9 @@ test('cleanPath rejects anything that could leave the project', () => {
 
 test('default ignore rules', () => {
   const ig = ignoreRules()
-  for (const p of ['node_modules/a/b.js', 'web/node_modules/x.js', '.env', '.env.local', 'api/.env', 'a.log', 'logs/x.log', 'dist/x.js', 'build/x', '.next/cache/x', 'coverage/lcov.info', '.DS_Store', 'sub/.DS_Store', 'certs/server.pem', 'id.key', '.git/HEAD', '.synchack/tmp/x', 'x.swp', 'notes.txt~'])
+  for (const p of ['node_modules/a/b.js', 'web/node_modules/x.js', '.env', '.env.local', 'api/.env', 'a.log', 'logs/x.log', 'dist/x.js', 'build/x', '.next/cache/x', 'coverage/lcov.info', '.DS_Store', 'sub/.DS_Store', 'certs/server.pem', 'id.key', '.git/HEAD', '.synchack/tmp/x', 'x.swp', 'notes.txt~', 'backend/.venv/bin/python', 'app/__pycache__/x.pyc', 'backend/.pytest_cache/v', 'test.db', 'backend/site.db', 'data/app.sqlite3', 'x.db-wal'])
     assert.ok(ig(p), `${p} should be ignored`)
-  for (const p of ['src/App.tsx', 'package.json', '.envrc', 'src/env.ts', 'docs/build.md', 'distance.ts', 'a.logic', 'keys.ts', 'build'])
+  for (const p of ['src/App.tsx', 'package.json', '.envrc', 'src/env.ts', 'docs/build.md', 'distance.ts', 'a.logic', 'keys.ts', 'build', 'src/db.ts', 'database/schema.sql', 'venv.md'])
     assert.ok(!ig(p), `${p} should sync`)
   assert.ok(ig('build', true))
 })

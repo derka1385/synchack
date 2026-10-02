@@ -1,0 +1,1071 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SyncHack</title>
+<style>
+/* ── tokens ──────────────────────────────────────────────────────────────
+   One dark theme today; every colour goes through these names so a light
+   theme is a second :root block later. */
+:root {
+  color-scheme: dark;
+  /* surfaces: the sidebar is the darker source list, content sits one step up */
+  --bg-side: #0c0d0f;
+  --bg: #111215;
+  --surface: #17181c;          /* raised: sheets, inputs, buttons */
+  --surface-hover: #1c1e22;
+  --surface-active: #23252a;
+  --line: rgb(255 255 255 / .065);
+  --line-strong: rgb(255 255 255 / .11);
+  /* text */
+  --text: #e4e5e8;
+  --text-2: #a2a6ae;
+  --text-3: #6f737b;
+  --text-on-accent: #04201b;
+  /* accent: calm teal, only for the primary action, selection and focus */
+  --accent: #4cc2ae;
+  --accent-hover: #63d1be;
+  --accent-soft: rgb(76 194 174 / .14);
+  --focus: rgb(76 194 174 / .55);
+  /* status */
+  --ok: #58b97a;   --ok-soft: rgb(88 185 122 / .14);   --ok-text: #9fd7b2;
+  --calm: #7ea6e0; --calm-soft: rgb(126 166 224 / .14); --calm-text: #b5cbee;
+  --warn: #d6a24a; --warn-soft: rgb(214 162 74 / .12);  --warn-text: #e8c27f;
+  --bad: #e2766b;  --bad-soft: rgb(226 118 107 / .11);  --bad-text: #f0a69e;
+  --off: #6f737b;
+  --side-a: #93c2f5; --side-b: #e6a1f0; /* conflict versions A and B */
+  /* type */
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --fs-xs: 11px; --fs-sm: 12px; --fs-md: 13px; --fs-lg: 15px; --fs-xl: 19px;
+  /* spacing: 4 px rhythm */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 20px; --s6: 24px; --s8: 32px;
+  /* radius */
+  --r-sm: 5px; --r-md: 7px; --r-lg: 10px;
+  --shadow-pop: 0 1px 0 rgb(255 255 255 / .04) inset, 0 12px 32px rgb(0 0 0 / .45), 0 2px 6px rgb(0 0 0 / .3);
+  --ease: cubic-bezier(.16, 1, .3, 1);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: var(--fs-md)/1.45 var(--font); -webkit-font-smoothing: antialiased; }
+button, input, textarea { font: inherit; color: inherit; }
+::selection { background: rgb(76 194 174 / .32); }
+input, textarea { caret-color: var(--accent); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; border-radius: var(--r-sm); }
+* { scrollbar-width: thin; scrollbar-color: #2a2c31 transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #2a2c31; border-radius: 10px; border: 3px solid transparent; background-clip: content-box; }
+a { color: var(--accent); text-underline-offset: 3px; }
+.mono, code { font-family: var(--mono); font-size: 12px; }
+.num { font-variant-numeric: tabular-nums; }
+.t2 { color: var(--text-2); } .t3 { color: var(--text-3); }
+.small { font-size: var(--fs-sm); }
+svg.i { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+svg.i.sm { width: 14px; height: 14px; }
+
+/* ── shell ───────────────────────────────────────────────────────────── */
+.app { display: grid; grid-template-columns: 248px minmax(0, 1fr); height: 100vh; }
+aside.side { background: var(--bg-side); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+.side-top { padding: var(--s4) var(--s3) var(--s1); display: flex; gap: var(--s2); }
+.side-top .btn:first-child { flex: 1; }
+.side-scroll { flex: 1; overflow: auto; padding: 0 var(--s2) var(--s3); }
+.group { margin-top: var(--s4); }
+.group-h { display: flex; align-items: center; justify-content: space-between; height: 24px; padding: 0 var(--s2); font-size: var(--fs-xs); font-weight: 600; color: var(--text-3); }
+.item { display: flex; align-items: center; gap: var(--s2); height: 30px; padding: 0 var(--s2); border-radius: var(--r-md); color: var(--text-2); cursor: default; user-select: none; }
+.item:hover { background: var(--surface-hover); color: var(--text); }
+.item.sel { background: var(--surface-active); color: var(--text); }
+.item .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .meta { font-size: var(--fs-xs); color: var(--text-3); display: flex; align-items: center; gap: 5px; }
+.item .hover-only { display: none; }
+.item:hover .hover-only, .item:focus-within .hover-only { display: inline-flex; }
+.side-note { padding: var(--s1) var(--s2); font-size: var(--fs-sm); color: var(--text-3); line-height: 1.4; }
+.me { border-top: 1px solid var(--line); padding: var(--s3); display: flex; align-items: center; gap: var(--s2); }
+.me .who { flex: 1; min-width: 0; }
+.me .who b { display: block; font-weight: 600; }
+.me .who span { display: block; font-size: var(--fs-sm); color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ── primitives ──────────────────────────────────────────────────────── */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 28px; padding: 0 var(--s3); border-radius: var(--r-md); border: 1px solid var(--line-strong); background: var(--surface); color: var(--text); font-size: var(--fs-md); font-weight: 500; white-space: nowrap; cursor: default; transition: background .15s, border-color .15s, color .15s; }
+.btn:hover { background: var(--surface-hover); border-color: rgb(255 255 255 / .16); }
+.btn:active { background: var(--surface-active); }
+.btn.primary { background: var(--accent); border-color: transparent; color: var(--text-on-accent); font-weight: 600; }
+.btn.primary:hover { background: var(--accent-hover); }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--text-2); }
+.btn.quiet:hover { background: var(--surface-hover); color: var(--text); }
+.btn.sm { height: 24px; padding: 0 var(--s2); font-size: var(--fs-sm); }
+.btn.icon { width: 28px; padding: 0; }
+.btn.icon.sm { width: 24px; }
+.btn:disabled { opacity: .45; pointer-events: none; }
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--off); }
+.dot.ok { background: var(--ok); } .dot.calm { background: var(--calm); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+.dot.pulse { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+.avatar { position: relative; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 10.5px; font-weight: 650; flex: none; }
+.avatar.lg { width: 28px; height: 28px; font-size: 12px; }
+.avatar .presence { position: absolute; right: -2px; bottom: -2px; width: 9px; height: 9px; border-radius: 50%; border: 2px solid var(--bg-side); background: var(--off); }
+.avatar .presence.on { background: var(--ok); }
+.badge { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 var(--s2); border-radius: 99px; font-size: var(--fs-sm); font-weight: 500; white-space: nowrap; color: var(--text-2); background: var(--surface-hover); }
+.badge.ok { background: var(--ok-soft); color: var(--ok-text); } .badge.calm { background: var(--calm-soft); color: var(--calm-text); }
+.badge.warn { background: var(--warn-soft); color: var(--warn-text); } .badge.bad { background: var(--bad-soft); color: var(--bad-text); }
+.count { font-size: var(--fs-xs); color: var(--text-3); font-weight: 500; }
+.you { font-size: 10px; font-weight: 600; color: var(--text-3); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 4px; line-height: 14px; }
+
+/* segmented control */
+.seg { display: inline-flex; padding: 2px; gap: 2px; border-radius: var(--r-md); background: var(--bg-side); border: 1px solid var(--line); }
+.seg button { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-3); font-size: var(--fs-sm); font-weight: 500; cursor: default; transition: background .15s, color .15s; }
+.seg button:hover { color: var(--text); }
+.seg button.on { background: var(--surface-active); color: var(--text); box-shadow: 0 1px 2px rgb(0 0 0 / .35); }
+
+/* toggle */
+.switch { position: relative; width: 28px; height: 16px; border-radius: 99px; background: #2c2e33; border: 0; padding: 0; cursor: default; flex: none; transition: background .15s; }
+.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: #b9bcc3; transition: transform .18s var(--ease), background .15s; }
+.switch.on { background: var(--accent); } .switch.on::after { transform: translateX(12px); background: #fff; }
+
+/* text input */
+.field { width: 100%; height: 32px; padding: 0 var(--s3); border-radius: var(--r-md); border: 1px solid var(--line-strong); background: var(--bg-side); outline: none; transition: border-color .15s, box-shadow .15s; }
+textarea.field { height: 110px; padding: var(--s2) var(--s3); resize: vertical; font-family: var(--mono); font-size: 12px; }
+.field:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.field.mono { font-family: var(--mono); font-size: 12.5px; }
+.field::placeholder { color: var(--text-3); }
+
+/* tooltip (data-tip) */
+[data-tip] { position: relative; }
+[data-tip]:hover::after { content: attr(data-tip); position: absolute; z-index: 60; top: calc(100% + 6px); left: 50%; transform: translateX(-50%); width: max-content; max-width: 260px; padding: 5px 8px; border-radius: var(--r-sm); background: #26282d; color: var(--text); font-size: var(--fs-sm); font-weight: 400; line-height: 1.35; white-space: normal; text-align: left; box-shadow: var(--shadow-pop); pointer-events: none; }
+[data-tip-end]:hover::after { left: auto; right: 0; transform: none; }
+
+/* ── project view ────────────────────────────────────────────────────── */
+main { min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+.bar { flex: none; display: flex; align-items: center; gap: var(--s3); height: 56px; padding: 0 var(--s5); border-bottom: 1px solid var(--line); }
+.bar .title { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: var(--s3); }
+.bar h1 { margin: 0; font-size: var(--fs-xl); font-weight: 650; letter-spacing: -.2px; white-space: nowrap; }
+.bar .path { color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.bar .tools { display: flex; align-items: center; gap: var(--s2); }
+.body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 316px; }
+.content { overflow: auto; padding: var(--s4) var(--s5) var(--s8); min-width: 0; }
+.rail { overflow: auto; border-left: 1px solid var(--line); background: var(--bg-side); }
+.rail section { padding: var(--s4); }
+.rail section + section { border-top: 1px solid var(--line); }
+.sec-h { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); min-height: 24px; margin-bottom: var(--s2); }
+.sec-h h2 { margin: 0; font-size: var(--fs-md); font-weight: 600; }
+
+/* notices: conflict, two editors, errors */
+.notice { display: flex; align-items: center; gap: var(--s3); padding: var(--s3) var(--s3) var(--s3) var(--s4); border-radius: var(--r-lg); margin-bottom: var(--s3); border: 1px solid; }
+.notice .txt { flex: 1; min-width: 0; }
+.notice b { font-weight: 600; }
+.notice .sub { color: var(--text-2); font-size: var(--fs-sm); margin-top: 1px; }
+.notice.bad { background: var(--bad-soft); border-color: rgb(226 118 107 / .28); }
+.notice.bad > .i { color: var(--bad); }
+.notice.warn { background: var(--warn-soft); border-color: rgb(214 162 74 / .25); }
+.notice.warn > .i { color: var(--warn); }
+
+/* file list */
+.files-h { display: flex; align-items: center; gap: var(--s1); margin: var(--s1) 0 var(--s2); }
+.files-h h2 { margin: 0 var(--s2) 0 0; font-size: var(--fs-md); font-weight: 600; }
+.files-h .spacer { flex: 1; }
+.table { border-top: 1px solid var(--line); }
+.cols { display: grid; grid-template-columns: minmax(0, 1fr) 150px 64px; align-items: center; gap: var(--s3); }
+.thead { height: 28px; font-size: var(--fs-xs); color: var(--text-3); font-weight: 500; border-bottom: 1px solid var(--line); padding: 0 var(--s2); }
+.row { height: 32px; padding: 0 var(--s2); border-radius: var(--r-sm); }
+.row:hover { background: var(--surface-hover); }
+.row[data-act] { cursor: pointer; }
+.row[data-act] .btn, .row[data-act] .switch { cursor: default; }
+.row .name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.row .chev { width: 16px; height: 16px; display: grid; place-items: center; color: var(--text-3); flex: none; border-radius: 4px; }
+.row .chev[data-act]:hover { color: var(--text); background: var(--surface-active); }
+.row .chev svg { transition: transform .15s var(--ease); }
+.row .chev.open svg { transform: rotate(90deg); }
+.row .kind { color: var(--text-3); display: grid; }
+.row .kind.dir { color: #8fa3bd; }
+.row .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .local { font-size: var(--fs-xs); color: var(--text-3); white-space: nowrap; }
+.row.off .fname, .row.off .kind { color: var(--text-3); }
+.row .who { font-size: var(--fs-sm); color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .who.fresh { color: var(--warn-text); }
+.row .end { display: flex; align-items: center; justify-content: flex-end; gap: var(--s2); }
+.row .end .row-hist { visibility: hidden; }
+.row:hover .end .row-hist, .row .end .row-hist:focus-visible { visibility: visible; }
+.row .secret { color: var(--text-3); display: inline-flex; }
+.row.drop { outline: 1px dashed var(--accent); outline-offset: -1px; background: var(--accent-soft); }
+.drop-hint { margin-top: var(--s3); display: flex; align-items: center; gap: var(--s2); color: var(--text-3); font-size: var(--fs-sm); }
+.content.dragging .table { outline: 1px dashed var(--accent); outline-offset: 4px; border-radius: var(--r-md); }
+
+.empty { padding: var(--s8) var(--s4); display: grid; justify-items: center; text-align: center; gap: var(--s2); }
+.empty .glyph { width: 40px; height: 40px; border-radius: var(--r-lg); background: var(--surface); border: 1px solid var(--line); display: grid; place-items: center; color: var(--text-2); margin-bottom: var(--s1); }
+.empty h3 { margin: 0; font-size: var(--fs-lg); font-weight: 600; }
+.empty p { margin: 0; color: var(--text-2); max-width: 440px; }
+.empty .acts { display: flex; gap: var(--s2); margin-top: var(--s2); flex-wrap: wrap; justify-content: center; }
+.cmd { display: inline-flex; align-items: center; gap: var(--s2); margin-top: var(--s3); padding: 4px 4px 4px 10px; border-radius: var(--r-md); background: var(--bg-side); border: 1px solid var(--line); }
+.cmd code { color: var(--text-2); }
+
+/* presence */
+.person { display: flex; gap: var(--s3); padding: 7px 0; align-items: flex-start; }
+.person .avatar .presence { border-color: var(--bg-side); }
+.person .info { flex: 1; min-width: 0; }
+.person .line1 { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.person .line1 b { font-weight: 550; white-space: nowrap; }
+.person .line1 .dev { color: var(--text-3); font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.person .doing { margin-top: 2px; font-size: var(--fs-sm); color: var(--text-3); display: grid; gap: 1px; }
+.person .doing .f { display: flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; }
+.person .doing .f code { overflow: hidden; text-overflow: ellipsis; color: var(--text-2); font-size: 11.5px; min-width: 0; }
+.person .doing .f.live { color: var(--warn-text); }
+.person .doing .f.live code { color: var(--warn-text); }
+
+/* invite */
+.invite-code { display: flex; align-items: center; gap: var(--s2); padding: 6px 6px 6px var(--s3); border-radius: var(--r-md); background: var(--bg); border: 1px solid var(--line-strong); }
+.invite-code .code { font-family: var(--mono); font-size: var(--fs-lg); font-weight: 600; letter-spacing: 1.5px; flex: 1; }
+.invite-meta { display: flex; justify-content: space-between; gap: var(--s3); margin-top: 6px; font-size: var(--fs-sm); color: var(--text-3); }
+.invite-meta code { font-size: 11px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nearby-invite { margin: var(--s3) calc(var(--s2) * -1) 0; }
+
+/* activity */
+.ev { display: grid; grid-template-columns: 36px 16px minmax(0, 1fr); gap: 8px; padding: 3px 0; align-items: start; font-size: var(--fs-sm); }
+.ev time { color: var(--text-3); font-size: var(--fs-xs); line-height: 18px; }
+.ev .ico { display: grid; place-items: center; height: 18px; color: var(--text-3); }
+.ev .ico.up { color: var(--accent); } .ev .ico.down { color: var(--ok); } .ev .ico.merge { color: var(--calm); } .ev .ico.bad { color: var(--bad); } .ev .ico.warn { color: var(--warn); }
+.ev .msg { color: var(--text-2); line-height: 18px; overflow-wrap: anywhere; }
+.ev .msg b { color: var(--text); font-weight: 500; }
+.ev .msg code { font-size: 11.5px; color: var(--text); }
+
+/* welcome */
+.welcome { flex: 1; overflow: auto; display: grid; place-items: center; padding: var(--s8); }
+.welcome .inner { max-width: 540px; width: 100%; }
+.welcome h1 { font-size: 26px; letter-spacing: -.4px; margin: 0 0 var(--s2); font-weight: 650; }
+.welcome p.lead { color: var(--text-2); font-size: var(--fs-lg); margin: 0 0 var(--s6); line-height: 1.5; }
+.welcome ol { list-style: none; margin: 0 0 var(--s6); padding: 0; display: grid; gap: var(--s4); }
+.welcome li { display: grid; grid-template-columns: 24px 1fr; gap: var(--s3); align-items: start; }
+.welcome li .n { width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--line-strong); display: grid; place-items: center; font-size: var(--fs-xs); color: var(--text-2); font-weight: 600; margin-top: 1px; }
+.welcome li b { display: block; font-weight: 600; margin-bottom: 1px; }
+.welcome li span { color: var(--text-2); }
+.welcome .acts { display: flex; gap: var(--s2); }
+.welcome .acts .btn { height: 32px; padding: 0 var(--s4); }
+
+/* sheets */
+.overlay { position: fixed; inset: 0; z-index: 40; background: rgb(0 0 0 / .5); display: grid; justify-items: center; align-items: start; padding: 9vh var(--s4) var(--s4); animation: fade .16s var(--ease); }
+.sheet { width: min(560px, 100%); max-height: 82vh; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 12px; box-shadow: var(--shadow-pop); animation: rise .2s var(--ease); }
+.sheet.wide { width: min(880px, 100%); }
+.sheet-h { padding: var(--s4) var(--s5) var(--s3); display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s3); }
+.sheet-h h3 { margin: 0; font-size: var(--fs-lg); font-weight: 600; }
+.sheet-h p { margin: 3px 0 0; color: var(--text-2); font-size: var(--fs-sm); }
+.sheet-b { padding: 0 var(--s5) var(--s4); overflow: auto; }
+.sheet-f { padding: var(--s3) var(--s5) var(--s4); display: flex; align-items: center; justify-content: space-between; gap: var(--s3); border-top: 1px solid var(--line); }
+.sheet-f .note { font-size: var(--fs-sm); color: var(--text-3); }
+.steps { display: flex; gap: 6px; margin-top: var(--s3); }
+.steps i { height: 3px; width: 26px; border-radius: 3px; background: var(--line-strong); }
+.steps i.on { background: var(--accent); }
+@keyframes fade { from { opacity: 0; } }
+@keyframes rise { from { opacity: 0; transform: translateY(6px) scale(.99); } }
+.list { border: 1px solid var(--line); border-radius: var(--r-md); overflow: auto; }
+.list .li { display: flex; align-items: center; gap: var(--s2); min-height: 32px; padding: 0 var(--s3); cursor: default; }
+.list .li + .li { border-top: 1px solid var(--line); }
+.list .li[data-act]:hover { background: var(--surface-hover); }
+.list .li.on { background: var(--surface-active); }
+.pathrow { display: flex; gap: var(--s2); }
+.pathrow .field { flex: 1; min-width: 0; }
+.form-note { display: flex; gap: 6px; align-items: flex-start; margin: 6px 0 var(--s3); font-size: var(--fs-sm); color: var(--text-3); }
+.form-note svg { margin-top: 2px; }
+.form-note.error { color: var(--bad-text); }
+.form-note.new { color: var(--calm-text); }
+.plines { display: grid; gap: 6px; margin: var(--s1) 0 var(--s3); }
+.pline { display: flex; gap: var(--s2); align-items: flex-start; }
+.pline svg { margin-top: 2px; }
+.pick { display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3); border-radius: var(--r-md); border: 1px solid var(--line); cursor: default; }
+.pick + .pick { margin-top: 6px; }
+.pick:hover { background: var(--surface-hover); }
+.pick.on { border-color: rgb(76 194 174 / .5); background: var(--accent-soft); }
+.check { width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid var(--line-strong); display: grid; place-items: center; color: var(--text-on-accent); flex: none; }
+.pick.on .check { background: var(--accent); border-color: var(--accent); }
+.result { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); padding: var(--s3); border-radius: var(--r-md); background: var(--bg-side); border: 1px solid var(--line); }
+.result + .result { margin-top: 6px; }
+.bigcode { font-family: var(--mono); font-size: 24px; font-weight: 650; letter-spacing: 2px; color: var(--accent); }
+.subhead { font-size: var(--fs-sm); font-weight: 600; color: var(--text-2); margin: var(--s4) 0 6px; }
+pre.code { margin: 0; padding: var(--s3); background: var(--bg-side); border: 1px solid var(--line); border-radius: var(--r-md); max-height: 52vh; overflow: auto; font: 12px/1.55 var(--mono); }
+pre.code .a { color: var(--side-a); } pre.code .b { color: var(--side-b); } pre.code .m { color: var(--text-3); }
+pre.code.diff > span { display: block; padding: 0 4px; margin: 0 -4px; border-radius: 3px; }
+pre.code .add { color: #8fd3a5; background: rgb(88 185 122 / .09); } pre.code .del { color: var(--bad-text); background: rgb(226 118 107 / .09); } pre.code .fold { color: var(--text-3); font-style: italic; }
+.hist-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: var(--s4); min-height: 320px; }
+.hist-layout .list { max-height: 54vh; align-self: start; }
+.ver { display: block !important; padding: 7px var(--s3) !important; }
+.ver b { font-family: var(--mono); font-size: 12px; font-weight: 600; }
+.ver span.by { display: block; color: var(--text-3); font-size: var(--fs-sm); }
+.tag { font-size: 10px; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 1px 5px; margin-left: 6px; }
+.tag.muted { color: var(--text-3); background: var(--surface-active); }
+
+/* invitations received, toasts */
+.inbox { position: fixed; right: var(--s4); bottom: var(--s4); z-index: 45; display: grid; gap: var(--s2); width: 320px; }
+.inv { background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--r-lg); padding: var(--s3) var(--s3) var(--s3) var(--s4); box-shadow: var(--shadow-pop); animation: rise .22s var(--ease); }
+.inv .top { display: flex; gap: var(--s3); align-items: flex-start; }
+.inv .avatar .presence { border-color: var(--surface); }
+.inv b { font-weight: 600; }
+.inv p { margin: 2px 0 0; color: var(--text-2); font-size: var(--fs-sm); }
+.inv .row2 { display: flex; gap: var(--s2); margin-top: var(--s3); }
+.inv .field { text-transform: uppercase; letter-spacing: 2px; font-family: var(--mono); }
+.toasts { position: fixed; left: 50%; bottom: var(--s5); transform: translateX(-50%); z-index: 50; display: grid; gap: 6px; justify-items: center; pointer-events: none; }
+.toast { display: inline-flex; align-items: center; gap: var(--s2); max-width: min(560px, 90vw); padding: 7px var(--s3); border-radius: 99px; background: #25272c; border: 1px solid var(--line-strong); box-shadow: var(--shadow-pop); font-size: var(--fs-sm); animation: rise .2s var(--ease); }
+.toast svg { color: var(--ok); }
+.toast.error { border-radius: var(--r-md); }
+.toast.error svg { color: var(--bad); }
+.gone { position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; background: rgb(12 13 15 / .94); text-align: center; color: var(--text-2); }
+.gone h2 { margin: var(--s3) 0 6px; font-size: var(--fs-lg); color: var(--text); }
+.gone p { margin: 0; }
+
+@media (max-width: 1100px) { main { overflow: auto; } .body { grid-template-columns: 1fr; flex: none; } .content { overflow: visible; } .rail { border-left: 0; border-top: 1px solid var(--line); overflow: visible; } }
+@media (max-width: 760px) { .app { grid-template-columns: 1fr; } aside.side { display: none; } .bar { flex-wrap: wrap; height: auto; padding: var(--s3) var(--s4); } .content { padding: var(--s3) var(--s4) var(--s6); } .cols { grid-template-columns: minmax(0, 1fr) 64px; } .cols .c-who, .row .who { display: none; } .hist-layout { grid-template-columns: 1fr; } .bar .tools { flex-wrap: wrap; } }
+@media (prefers-reduced-motion: reduce) { *, ::before, ::after { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side" id="side"></aside>
+  <main id="main"></main>
+</div>
+<div id="modal"></div>
+<div class="inbox" id="inbox"></div>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script>
+'use strict'
+const token = new URLSearchParams(location.hash.slice(1)).get('t')
+let S = null // latest snapshot pushed by synchack
+let sel = sessionStorage.getItem('sel')
+let modal = null
+const tree = { open: new Set(['']), cache: new Map(), project: null }
+const presence = new Map() // project → device → online, to narrate joins and departures
+const extra = new Map() // project → client-side events [{at, kind, html}]
+
+// ── icons: one stroke family, drawn here ─────────────────────────────────
+const P = {
+  plus: '<path d="M8 3v10M3 8h10"/>',
+  join: '<path d="M8 2.5v7.5M4.8 6.8 8 10l3.2-3.2"/><path d="M3 12.5h10"/>',
+  folder: '<path d="M2 4.6c0-.6.5-1.1 1.1-1.1h3l1.4 1.6h5.4c.6 0 1.1.5 1.1 1.1v5.7c0 .6-.5 1.1-1.1 1.1H3.1c-.6 0-1.1-.5-1.1-1.1z"/>',
+  file: '<path d="M4.6 2H9l3 3v8.4c0 .3-.3.6-.6.6H4.6c-.3 0-.6-.3-.6-.6V2.6c0-.3.3-.6.6-.6Z"/><path d="M9 2v3h3"/>',
+  chev: '<path d="m6 4 4 4-4 4"/>',
+  back: '<path d="m10 4-4 4 4 4"/>',
+  copy: '<rect x="5.5" y="5.5" width="8" height="8" rx="1.4"/><path d="M10.5 5.5V3.6c0-.6-.5-1.1-1.1-1.1H3.6c-.6 0-1.1.5-1.1 1.1v5.8c0 .6.5 1.1 1.1 1.1h1.9"/>',
+  check: '<path d="m3.5 8.5 3 3 6-7"/>',
+  open: '<path d="M9 2.5h4.5V7"/><path d="M13.5 2.5 7.5 8.5"/><path d="M12 9.5v3c0 .6-.4 1-1 1H3.5c-.6 0-1-.4-1-1V5c0-.6.4-1 1-1h3"/>',
+  history: '<path d="M2.6 8a5.4 5.4 0 1 0 1.6-3.8"/><path d="M2.5 2.8v2.9h2.9"/><path d="M8 5.3V8l1.9 1.3"/>',
+  trash: '<path d="M2.8 4.3h10.4M6.3 4.3V3c0-.3.3-.6.6-.6h2.2c.3 0 .6.3.6.6v1.3M4.2 4.3l.6 8.6c0 .4.4.7.8.7h4.8c.4 0 .8-.3.8-.7l.6-8.6"/>',
+  refresh: '<path d="M13.2 7.6A5.2 5.2 0 0 0 3.9 4.6M2.8 8.4a5.2 5.2 0 0 0 9.3 3"/><path d="M3.6 2.4v2.5h2.5M12.4 13.6v-2.5H9.9"/>',
+  alert: '<path d="M8 2.6 14 13H2z"/><path d="M8 6.6v2.9M8 11.4v.1"/>',
+  bolt: '<path d="M9 1.8 3.8 9h4l-.8 5.2L12.2 7H8.2z"/>',
+  up: '<path d="M8 13V3.5M4.5 7 8 3.5 11.5 7"/>',
+  down: '<path d="M8 3v9.5M4.5 9 8 12.5 11.5 9"/>',
+  merge: '<circle cx="4.5" cy="3.5" r="1.4"/><circle cx="4.5" cy="12.5" r="1.4"/><circle cx="11.5" cy="8" r="1.4"/><path d="M4.5 5v6M4.5 5.5c0 2.2 1.8 2.5 5.6 2.5"/>',
+  minus: '<path d="M3.5 8h9"/>',
+  live: '<circle cx="8" cy="8" r="1.6"/><path d="M5 5a4.2 4.2 0 0 0 0 6M11 5a4.2 4.2 0 0 1 0 6"/>',
+  calm: '<path d="M2.5 6.3c1.8-1.4 3.2-1.4 5.5 0s3.7 1.4 5.5 0M2.5 10.3c1.8-1.4 3.2-1.4 5.5 0s3.7 1.4 5.5 0"/>',
+  pause: '<path d="M6 3.5v9M10 3.5v9"/>',
+  plug: '<path d="M6 2.5v3M10 2.5v3M4.5 5.5h7v2.2a3.5 3.5 0 0 1-7 0z"/><path d="M8 11.2v2.3"/>',
+  wifioff: '<path d="M2.5 2.5l11 11"/><path d="M5.2 8.6a4.1 4.1 0 0 1 2.3-1M2.8 6.2A7.6 7.6 0 0 1 6 4.4M13.2 6.2a7.6 7.6 0 0 0-3.3-1.8"/><path d="M8 12.2h.01"/>',
+  lock: '<rect x="3.3" y="7" width="9.4" height="6.5" rx="1.3"/><path d="M5.5 7V5.2a2.5 2.5 0 0 1 5 0V7"/>',
+  user: '<circle cx="8" cy="5.5" r="2.6"/><path d="M3 13.5c.7-2.3 2.7-3.6 5-3.6s4.3 1.3 5 3.6"/>',
+  userplus: '<circle cx="6.5" cy="5.5" r="2.5"/><path d="M2 13.5c.6-2.2 2.4-3.5 4.5-3.5 1.4 0 2.6.5 3.4 1.5M12.5 6.5v4M10.5 8.5h4"/>',
+  x: '<path d="m4 4 8 8M12 4l-8 8"/>',
+  terminal: '<rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="m4.8 6.3 2 1.7-2 1.7M8.5 9.7h2.7"/>',
+  drop: '<path d="M8 2.5v7M5.2 6.7 8 9.5l2.8-2.8"/><path d="M2.5 10.5v1.8c0 .7.5 1.2 1.2 1.2h8.6c.7 0 1.2-.5 1.2-1.2v-1.8"/>',
+  link: '<path d="M6.8 9.2a2.8 2.8 0 0 0 4 0l1.9-1.9a2.8 2.8 0 0 0-4-4l-.7.7"/><path d="M9.2 6.8a2.8 2.8 0 0 0-4 0L3.3 8.7a2.8 2.8 0 0 0 4 4l.7-.7"/>',
+}
+const icon = (n, cls = '') => `<svg class="i ${cls}" viewBox="0 0 16 16" aria-hidden="true">${P[n]}</svg>`
+
+// ── helpers ──────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id)
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+const first = n => (n || '?').trim().replace(/ \(.*\)$/, '')
+const hue = n => [...String(first(n))].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 11)
+const avatar = (name, online, cls = '') => `<span class="avatar ${cls}" style="background:hsl(${hue(name)} 22% 21%);color:hsl(${hue(name)} 55% 80%)" aria-hidden="true">${esc(first(name)[0]?.toUpperCase() ?? '?')}${online === undefined ? '' : `<i class="presence ${online ? 'on' : ''}"></i>`}</span>`
+const ago = t => { const s = Math.max(0, Math.round((Date.now() - t) / 1000)); return s < 10 ? 'now' : s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d` }
+const when = t => (ago(t) === 'now' ? 'just now' : `${ago(t)} ago`)
+const hhmm = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
+const api = async (action, body = {}) => {
+  const r = await fetch(`/api/${action}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-token': token }, body: JSON.stringify(body) })
+  const j = await r.json().catch(() => ({}))
+  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`)
+  return j
+}
+const toast = (text, error = false) => {
+  const t = document.createElement('div')
+  t.className = `toast${error ? ' error' : ''}`
+  t.innerHTML = `${icon(error ? 'alert' : 'check', 'sm')}<span>${esc(text)}</span>`
+  $('toasts').append(t)
+  setTimeout(() => t.remove(), error ? 7000 : 3200)
+}
+const run = (work, ok) => work.then(r => { if (ok) toast(typeof ok === 'function' ? ok(r) : ok); return r }, e => { toast(e.message, true); throw e })
+const copy = (text, what = 'Copied') => navigator.clipboard.writeText(text).then(() => toast(what), () => toast('Copy failed: select the text and copy it by hand', true))
+const project = () => S?.projects.find(p => p.id === sel) ?? S?.projects[0]
+/** "HX7-K92@192.168.1.129:8787#pin" → its human part and its technical part (the full string is what gets copied) */
+const splitInvite = inv => { const at = inv.indexOf('@'); return at < 0 ? { code: inv, host: '' } : { code: inv.slice(0, at), host: inv.slice(at + 1).split('#')[0] } }
+const syncState = p => p.mode === 'paused' ? { cls: 'warn', dot: 'warn', text: 'Paused', tip: 'Local only: nothing goes in or out. Your edits wait on this Mac.' }
+  : !p.online ? { cls: 'bad', dot: 'bad pulse', text: 'Reconnecting', tip: 'The host is out of reach. Keep working: everything syncs when it is back.' }
+  : p.pending ? { cls: 'calm', dot: 'calm pulse', text: `Syncing ${p.pending} file${p.pending > 1 ? 's' : ''}`, tip: 'Sending your latest changes' }
+  : { cls: 'ok', dot: 'ok', text: p.mode === 'calm' ? 'Synced · calm' : 'Synced', tip: 'Everyone has the same files' }
+const MODES = [
+  ['live', 'Live', 'live', 'ok', 'Changes go out about half a second after each save'],
+  ['calm', 'Calm', 'calm', 'calm', 'Changes are batched and go out after 15 s without edits'],
+  ['paused', 'Pause', 'pause', 'warn', 'Local only: nothing in or out until you resume'],
+]
+
+// ── live data ────────────────────────────────────────────────────────────
+function connect() {
+  const es = new EventSource(`/api/events?t=${encodeURIComponent(token)}`)
+  let last = ''
+  es.onmessage = e => {
+    $('gone')?.remove()
+    if (e.data === last) return // identical snapshot: keep the DOM (and its scroll) as it is
+    last = e.data
+    S = JSON.parse(e.data)
+    notePresence()
+    render()
+  }
+  es.onerror = () => {
+    if (!$('gone')) document.body.insertAdjacentHTML('beforeend', `<div class="gone" id="gone"><div>${icon('plug')}<h2>SyncHack isn’t running</h2><p>Type <code>/synchack</code> in Terminal. This window reconnects on its own.</p></div></div>`)
+  }
+}
+
+function notePresence() {
+  for (const p of S.projects) {
+    const before = presence.get(p.id)
+    if (before) for (const m of p.members) {
+      if (m.you) continue
+      const was = before.get(m.device)
+      const what = was === undefined ? 'joined the project' : was !== m.online ? (m.online ? 'came online' : 'went offline') : null
+      if (!what) continue
+      const list = extra.get(p.id) ?? []
+      list.push({ at: Date.now(), kind: m.online ? 'down' : 'muted', ico: m.online ? 'user' : 'wifioff', html: `<b>${esc(m.name)}</b> ${what}` })
+      extra.set(p.id, list.slice(-30))
+    }
+    presence.set(p.id, new Map(p.members.map(m => [m.device, m.online])))
+  }
+}
+
+function render() {
+  if (!S) return
+  renderSide()
+  renderMain()
+  renderInbox()
+  // live sheets follow the team (e.g. who's nearby), but never redraw a field being typed in
+  if (modal?.live && !(modal.type === 'new' && modal.step < 3)) renderModal()
+}
+
+// ── sidebar ──────────────────────────────────────────────────────────────
+function renderSide() {
+  const p = project()
+  const host = S.hosting ? 'Hosting on this Mac' : S.hostError ? 'Not hosting' : 'Connected to a server'
+  $('side').innerHTML = `
+    <div class="side-top">
+      <button class="btn" data-act="new" data-tip="Share a folder, new or existing (⌘N)">${icon('plus', 'sm')}New project</button>
+      <button class="btn icon" data-act="join" aria-label="Join with an invite" data-tip="Join with an invite" data-tip-end>${icon('join')}</button>
+    </div>
+    <div class="side-scroll">
+      <div class="group"><div class="group-h">Projects</div>
+        ${S.projects.length ? S.projects.map(x => {
+          const st = syncState(x)
+          const on = x.members.filter(m => m.online && !m.you).length
+          return `<div class="item ${x.id === p?.id ? 'sel' : ''}" data-act="select" data-id="${esc(x.id)}" tabindex="0" aria-current="${x.id === p?.id}">
+            <span class="t3" style="display:grid">${icon('folder', 'sm')}</span><span class="label">${esc(x.name)}</span>
+            <span class="meta">${x.conflicts.length ? `<span style="color:var(--bad);display:grid" title="${x.conflicts.length} conflict${x.conflicts.length > 1 ? 's' : ''}">${icon('alert', 'sm')}</span>` : ''}${on ? `<span class="num" title="${on} teammate${on > 1 ? 's' : ''} online">${on}</span>` : ''}<span class="dot ${st.dot.replace(' pulse', '')}" title="${esc(st.text)}"></span></span></div>`
+        }).join('') : '<div class="side-note">No projects yet.</div>'}
+      </div>
+      <div class="group"><div class="group-h">Nearby <span class="count num">${S.nearby.length || ''}</span></div>
+        ${S.nearby.length ? S.nearby.map(n => {
+          const member = p && n.projects.includes(p.id)
+          return `<div class="item">${avatar(n.name, true)}<span class="label">${esc(n.name)} <span class="t3">${esc(n.device)}</span></span>
+            ${p && !member ? `<button class="btn sm hover-only" data-act="invite-one" data-peer="${esc(n.id)}">Invite</button>` : member ? `<span class="meta" title="Already in ${esc(p.name)}">${icon('check', 'sm')}</span>` : ''}</div>`
+        }).join('') : '<div class="side-note">Teammates on this network who open SyncHack appear here.</div>'}
+      </div>
+    </div>
+    <div class="me">${avatar(S.me.user, true, 'lg')}<div class="who"><b>${esc(S.me.user)}</b>${S.hosting && !S.hosting.encrypted ? '<span style="color:var(--warn-text)" title="openssl is missing, so teammates connect over plain HTTP">Hosting · not encrypted</span>' : `<span>${esc(S.me.deviceName)} · ${host}</span>`}</div>
+      ${S.hosting ? `<button class="btn quiet icon" data-act="copy-install" aria-label="Copy install command" data-tip="Copy the install command for a teammate without SyncHack" data-tip-end>${icon('terminal')}</button>` : ''}</div>`
+}
+
+// ── project view ─────────────────────────────────────────────────────────
+function renderMain() {
+  const p = project()
+  if (!p) return void ($('main').innerHTML = welcome())
+  if (tree.project !== p.id) { tree.project = p.id; tree.open = new Set(['']); tree.cache.clear(); loadDir('') }
+  const st = syncState(p)
+  const others = p.members.filter(m => !m.you)
+  const main = $('main')
+  const scroll = [main.scrollTop, $('content')?.scrollTop ?? 0, document.querySelector('.rail')?.scrollTop ?? 0]
+  $('main').innerHTML = `
+    <header class="bar">
+      <div class="title"><h1>${esc(p.name)}</h1><span class="path mono" title="${esc(p.root)}">${esc(p.root)}</span></div>
+      <div class="tools">
+        ${p.plain ? `<span class="badge warn" data-tip="This server uses plain HTTP: anyone on the network can read the files. Fine at home, not on public Wi-Fi.">${icon('lock', 'sm')}Not encrypted</span>` : ''}
+        <span class="badge ${st.cls}" data-tip="${esc(st.tip)}"><span class="dot ${st.dot}"></span>${esc(st.text)}</span>
+        <div class="seg" role="radiogroup" aria-label="Sync mode">${MODES.map(([m, label, ic, dot, tip]) => `<button role="radio" aria-checked="${p.mode === m}" class="${p.mode === m ? 'on' : ''}" data-act="mode" data-mode="${m}" data-tip="${tip}">${p.mode === m ? `<span class="dot ${dot}"></span>` : icon(ic, 'sm')}${label}</button>`).join('')}</div>
+        <button class="btn" data-act="invite">${icon('userplus', 'sm')}Invite</button>
+        <button class="btn icon" data-act="finder" aria-label="Open in Finder" data-tip="Open in Finder" data-tip-end>${icon('open')}</button>
+      </div>
+    </header>
+    <div class="body">
+      <div class="content" id="content">${notices(p)}${filesHtml(p)}</div>
+      <aside class="rail">
+        <section>
+          <div class="sec-h"><h2>People</h2><span class="count num">${p.members.filter(m => m.online).length} of ${p.members.length} online</span></div>
+          ${p.members.map(personHtml).join('')}
+          ${!others.length ? '<p class="t3 small" style="margin:var(--s1) 0 0">Just you so far. Invite a teammate to start syncing.</p>' : ''}
+        </section>
+        <section>${inviteHtml(p)}</section>
+        <section><div class="sec-h"><h2>Activity</h2></div><div id="feed">${activityHtml(p)}</div></section>
+      </aside>
+    </div>`
+  main.scrollTop = scroll[0]
+  if ($('content')) $('content').scrollTop = scroll[1]
+  const rail = document.querySelector('.rail')
+  if (rail) rail.scrollTop = scroll[2]
+}
+
+function notices(p) {
+  let out = ''
+  for (const c of p.conflicts) out += `<div class="notice bad" role="status">${icon('alert')}<div class="txt"><b>Conflict in <code>${esc(c.path)}</code></b>
+      <div class="sub">2 versions kept, from ${esc(c.a.who)}${c.a.deleted ? ' (deleted it)' : ''} and ${esc(c.b.who)}${c.b.deleted ? ' (deleted it)' : ''}. No work is lost until someone picks one.</div></div>
+      <button class="btn sm" data-act="conflict" data-id="${esc(c.id)}">Review conflict</button></div>`
+  for (const h of p.hot) out += `<div class="notice warn">${icon('bolt')}<div class="txt"><b>Two people are editing <code>${esc(h.path)}</code></b>
+      <div class="sub">${esc(h.people.join(' and '))} changed it in the last 10 minutes. Agree on who continues before it becomes a conflict.</div></div></div>`
+  const errs = Object.entries(p.errors)
+  if (errs.length) out += `<div class="notice bad">${icon('alert')}<div class="txt"><b>${errs.length === 1 ? 'A file can’t sync' : `${errs.length} files can’t sync`}</b>
+      ${errs.slice(0, 3).map(([path, e]) => `<div class="sub"><code>${esc(path || 'sync')}</code> · ${esc(e)}</div>`).join('')}</div></div>`
+  // a teammate changed a file that tools on this Mac run (package.json, .claude/…) or the sync rules
+  for (const f of p.flagged.slice(0, 3)) out += `<div class="notice warn">${icon('alert')}<div class="txt"><b>${f.who ? `${esc(f.who)} changed` : 'Changed:'} <code>${esc(f.path)}</code></b>
+      <div class="sub">${f.path === '.synchackignore' ? `New sync rules: ${esc(f.why)}. Check them in the file’s history.` : 'Tools on this Mac may run what it contains. Look at the change before you run anything.'}</div></div>
+      <button class="btn sm" data-act="history" data-path="${esc(f.path)}">Review change</button>
+      <button class="btn quiet icon sm" data-act="flag-ok" data-path="${esc(f.path)}" aria-label="Dismiss" data-tip="Dismiss" data-tip-end>${icon('x', 'sm')}</button></div>`
+  if (p.flagged.length > 3) out += `<div class="notice warn">${icon('alert')}<div class="txt"><b>${p.flagged.length - 3} more changed files that tools may run</b>
+      <div class="sub">${p.flagged.slice(3, 6).map(f => `<code>${esc(f.path)}</code>`).join(' · ')}${p.flagged.length > 6 ? ' …' : ''}</div></div>
+      <button class="btn sm" data-act="flag-ok">Dismiss all</button></div>`
+  return out
+}
+
+function personHtml(m) {
+  const files = m.files.slice(0, 2)
+  const more = m.files.length - files.length
+  return `<div class="person">${avatar(m.name, m.online, 'lg')}<div class="info">
+      <div class="line1"><b>${esc(m.name)}</b>${m.you ? '<span class="you">you</span>' : ''}<span class="dev">${esc(m.deviceName)}</span></div>
+      <div class="doing">${files.length ? files.map(f => `<span class="f ${f.editing ? 'live' : ''}">${f.editing ? 'Editing' : f.deleted ? 'Deleted' : 'Changed'} <code>${esc(f.path)}</code>${f.editing ? '' : `<span class="num">· ${ago(f.at)}</span>`}</span>`).join('') + (more > 0 ? `<span>and ${more} more</span>` : '')
+        : `<span>${m.online ? 'Idle' : 'Offline'}</span>`}</div>
+    </div></div>`
+}
+
+function inviteHtml(p) {
+  const { code, host } = splitInvite(p.invite)
+  const nearby = S.nearby.filter(n => !n.projects.includes(p.id))
+  return `<div class="sec-h"><h2>Invite</h2><button class="btn quiet sm" data-act="new-code" data-tip="Make a new code. The current one stops working." data-tip-end>${icon('refresh', 'sm')}New code</button></div>
+    <div class="invite-code"><span class="code">${esc(code)}</span><button class="btn sm" data-act="copy-invite" data-tip="Copies the whole invite, address included" data-tip-end>${icon('copy', 'sm')}Copy</button></div>
+    <div class="invite-meta"><span>Valid 48 h</span><code title="${esc(p.invite)}">${esc(host)}</code></div>
+    ${nearby.length ? `<div class="nearby-invite">${nearby.map(n => `<div class="item">${avatar(n.name, true)}<span class="label">${esc(n.name)} <span class="t3">${esc(n.device)}</span></span><button class="btn sm" data-act="invite-one" data-peer="${esc(n.id)}">Send</button></div>`).join('')}</div>` : ''}`
+}
+
+// raw engine log lines → readable events
+function parseLog(line) {
+  const m = line.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)?\s+(.*)$/i)
+  if (!m) return { at: null, text: line }
+  let h = Number(m[1])
+  if (m[4]) h = (h % 12) + (m[4].toUpperCase() === 'PM' ? 12 : 0)
+  const d = new Date()
+  d.setHours(h, Number(m[2]), Number(m[3] ?? 0), 0)
+  if (d.getTime() > Date.now() + 60_000) d.setDate(d.getDate() - 1)
+  return { at: d.getTime(), text: m[5] }
+}
+function humanize(t) {
+  let m
+  const C = s => `<code>${esc(s)}</code>`
+  if ((m = t.match(/^↑ (.+) \(v(\d+)\)$/))) return { kind: 'up', ico: 'up', html: `${C(m[1])} synced`, group: true }
+  if ((m = t.match(/^↓ (.+?)(?: from (.+))?$/))) return { kind: 'down', ico: 'down', html: m[2] ? `<b>${esc(first(m[2]))}</b> updated ${C(m[1])}` : `${C(m[1])} updated` }
+  if ((m = t.match(/^merged (.+) \(v\d+\)$/))) return { kind: 'merge', ico: 'merge', html: `${C(m[1])} merged automatically` }
+  if ((m = t.match(/^deleted (.+?) \(v\d+.*\)$/))) return { kind: 'muted', ico: 'trash', html: `${C(m[1])} deleted <span class="t3">· kept in history</span>` }
+  if ((m = t.match(/^conflict on (.+?): .+ vs .+, both versions kept$/))) return { kind: 'bad', ico: 'alert', html: `Conflict detected in ${C(m[1])}` }
+  if ((m = t.match(/^conflict on (.+) resolved by (.+)$/))) return { kind: 'merge', ico: 'check', html: `<b>${esc(first(m[2]))}</b> resolved the conflict in ${C(m[1])}` }
+  if ((m = t.match(/^mode: (\w+)$/))) return { kind: 'muted', ico: m[1] === 'paused' ? 'pause' : m[1], html: m[1] === 'paused' ? 'Paused syncing' : `Switched to ${m[1][0].toUpperCase() + m[1].slice(1)} mode` }
+  if ((m = t.match(/^connected; catching up on (\d+)/))) return { kind: 'muted', ico: 'refresh', html: `Connected · catching up on ${m[1]} change${m[1] === '1' ? '' : 's'}` }
+  if (t === 'connected') return { kind: 'muted', ico: 'check', html: 'Connected' }
+  if (t.startsWith('offline')) return { kind: 'warn', ico: 'wifioff', html: 'Offline · edits stay on this Mac until the host is back' }
+  if (/^upload failed/.test(t)) return { kind: 'warn', ico: 'refresh', html: 'Couldn’t reach the host · retrying' }
+  const bad = /error|refused|missing|can.t|✕/.test(t)
+  return { kind: bad ? 'bad' : 'muted', ico: bad ? 'alert' : 'minus', html: esc(t) }
+}
+function activityHtml(p) {
+  const events = [...p.log.map(l => { const { at, text } = parseLog(l); return { at, ...humanize(text) } }), ...(extra.get(p.id) ?? [])].filter(e => e.at).sort((a, b) => a.at - b.at)
+  const rows = [] // an import or a git checkout: one line, not two hundred
+  for (const e of events) {
+    const last = rows[rows.length - 1]
+    if (e.group && last?.group && e.at - last.at < 3000) { last.n = (last.n ?? 1) + 1; last.at = e.at; continue }
+    rows.push({ ...e })
+  }
+  if (!rows.length) return '<p class="t3 small" style="margin:0">Saves, merges and teammates joining appear here.</p>'
+  let prev = ''
+  return rows.slice(-60).reverse().map(e => {
+    const t = hhmm(e.at), show = t !== prev
+    prev = t
+    return `<div class="ev"><time class="num">${show ? t : ''}</time><span class="ico ${e.kind}">${icon(e.ico, 'sm')}</span><span class="msg">${e.n > 1 ? `<b>${e.n} files</b> synced` : e.html}</span></div>`
+  }).join('')
+}
+
+function welcome() {
+  return `<div class="welcome"><div class="inner">
+    <h1>Share a folder. Build in it together.</h1>
+    <p class="lead">Teammates get a live copy of the same project. Claude Code, Codex and your editor keep working on ordinary files while SyncHack keeps every Mac in step.</p>
+    <ol>
+      <li><span class="n num">1</span><div><b>Share a folder</b><span>New or existing. Secrets, <code>.git</code>, virtualenvs and <code>node_modules</code> stay on your Mac.</span></div></li>
+      <li><span class="n num">2</span><div><b>Invite your team</b><span>Pick people on your network, or send them the invite code.</span></div></li>
+      <li><span class="n num">3</span><div><b>Work as usual</b><span>See who edits what. Independent edits merge on their own, conflicts keep both versions.</span></div></li>
+    </ol>
+    <div class="acts"><button class="btn primary" data-act="new">${icon('plus', 'sm')}New project</button><button class="btn" data-act="join">${icon('join', 'sm')}Join with an invite</button></div>
+    ${S.hosting ? `<p class="t3 small" style="margin-top:var(--s5)">Teammate without SyncHack? <a href="#" data-act="copy-install">Copy the install command</a> and send it to them.</p>` : ''}
+  </div></div>`
+}
+
+// ── files ────────────────────────────────────────────────────────────────
+function filesHtml(p) {
+  const root = tree.cache.get('')
+  const empty = root && !root.length
+  return `<div class="files-h"><h2>Files</h2><span class="spacer"></span>
+      <button class="btn quiet sm" data-act="deleted" data-tip="Bring back files someone deleted">${icon('trash', 'sm')}Deleted</button>
+      <button class="btn quiet icon sm" data-act="refresh-files" aria-label="Refresh" data-tip="Refresh">${icon('refresh', 'sm')}</button>
+      <button class="btn sm" data-act="newfile">${icon('plus', 'sm')}New file</button></div>
+    ${empty ? emptyFiles(p) : `<div class="table"><div class="cols thead"><span>Name</span><span class="c-who">Last change</span><span style="text-align:right">Shared</span></div><div id="tree">${treeHtml(p)}</div></div>
+    <div class="drop-hint">${icon('drop', 'sm')}Click a file to show it in Finder · drop files here to add them · switch a row off to keep it on this Mac</div>`}`
+}
+
+function emptyFiles(p) {
+  return `<div class="table"><div class="empty">
+    <div class="glyph">${icon('folder')}</div>
+    <h3>This folder is empty</h3>
+    <p>Anything added to <code>${esc(p.root)}</code> reaches the team within a second. Drop files here, create one, or point your agent at the folder.</p>
+    <div class="acts"><button class="btn" data-act="newfile">${icon('plus', 'sm')}New file</button><button class="btn" data-act="finder">${icon('open', 'sm')}Open in Finder</button></div>
+    <div class="cmd"><code>cd ${esc(p.root)} &amp;&amp; claude</code><button class="btn quiet icon sm" data-act="copy-text" data-text="cd ${esc(p.root)} && claude" aria-label="Copy command" data-tip="Copy">${icon('copy', 'sm')}</button></div>
+  </div></div>`
+}
+
+async function loadDir(dir) {
+  const p = project()
+  if (!p) return
+  const before = JSON.stringify(tree.cache.get(dir) ?? null)
+  try { tree.cache.set(dir, await api('files', { project: p.id, dir })) } catch (e) { tree.cache.set(dir, []); toast(e.message, true) }
+  if (tree.project !== p.id) return
+  const now = tree.cache.get(dir)
+  if (dir === '' && (before === 'null' || (before === '[]') !== !now.length)) return renderMain() // loading → list, or empty ↔ not empty
+  const el = $('tree')
+  if (el && JSON.stringify(now) !== before) el.innerHTML = treeHtml(p)
+}
+
+function treeHtml(p, dir = '', depth = 0) {
+  const entries = tree.cache.get(dir)
+  if (!entries) return depth ? '' : '<div class="row" style="display:flex;align-items:center;color:var(--text-3)">Loading…</div>'
+  return entries.map(e => {
+    const open = e.dir && tree.open.has(e.path)
+    const t = p.touched[e.path]
+    const recent = t && Date.now() - t.at < 30 * 60_000
+    return `<div class="row cols ${e.shared ? '' : 'off'}" ${e.dir ? `data-dropdir="${esc(e.path)}" data-act="toggle-dir"` : 'data-act="reveal"'} data-path="${esc(e.path)}" title="${e.dir ? 'Click to open' : 'Click to show in Finder'}">
+      <span class="name" style="padding-left:${depth * 18}px">
+        ${e.dir ? `<span class="chev ${open ? 'open' : ''}" data-act="toggle-dir" data-path="${esc(e.path)}">${icon('chev', 'sm')}</span>` : '<span class="chev"></span>'}
+        <span class="kind ${e.dir ? 'dir' : ''}">${icon(e.dir ? 'folder' : 'file', 'sm')}</span>
+        <span class="fname">${esc(e.name)}</span>
+        ${e.shared ? '' : '<span class="local">this Mac only</span>'}
+      </span>
+      <span class="who ${recent && Date.now() - t.at < 120000 ? 'fresh' : ''}">${recent ? `${esc(t.who)} · <span class="num">${ago(t.at)}</span>` : ''}</span>
+      <span class="end">
+        ${e.dir ? `<button class="btn quiet icon sm row-hist" data-act="open-folder" data-path="${esc(e.path)}" aria-label="Open ${esc(e.name)} in Finder" data-tip="Open in Finder" data-tip-end>${icon('open', 'sm')}</button>` : ''}
+        ${!e.dir && e.shared ? `<button class="btn quiet icon sm row-hist" data-act="history" data-path="${esc(e.path)}" aria-label="History of ${esc(e.name)}" data-tip="Versions · restore an older one" data-tip-end>${icon('history', 'sm')}</button>` : ''}
+        ${e.secret ? `<span class="secret" data-tip="Secrets never leave this Mac" data-tip-end>${icon('lock', 'sm')}</span>` : `<button class="switch ${e.shared ? 'on' : ''}" role="switch" aria-checked="${e.shared}" aria-label="Share ${esc(e.name)}" data-act="share" data-path="${esc(e.path)}" data-dir="${e.dir ? 1 : ''}" data-shared="${e.shared ? '' : 1}"></button>`}
+      </span>
+    </div>${open ? treeHtml(p, e.path, depth + 1) : ''}`
+  }).join('')
+}
+
+setInterval(() => { // pick up files created by agents and teammates
+  const p = project()
+  if (p && tree.project === p.id && !document.hidden && !modal) for (const d of tree.open) if (tree.cache.has(d)) loadDir(d)
+}, 4000)
+
+// drag & drop into the project
+document.addEventListener('dragover', e => {
+  const zone = e.target.closest?.('#content')
+  if (!zone) return
+  e.preventDefault()
+  zone.classList.add('dragging')
+  document.querySelectorAll('.row.drop').forEach(r => r.classList.remove('drop'))
+  e.target.closest('[data-dropdir]')?.classList.add('drop')
+})
+document.addEventListener('dragleave', e => { if (!e.relatedTarget?.closest?.('#content')) $('content')?.classList.remove('dragging') })
+document.addEventListener('drop', async e => {
+  const zone = e.target.closest?.('#content')
+  if (!zone) return
+  e.preventDefault()
+  zone.classList.remove('dragging')
+  const dir = e.target.closest('[data-dropdir]')?.dataset.dropdir ?? ''
+  const p = project()
+  for (const file of e.dataTransfer.files) {
+    if (file.size > 30 * 1024 * 1024) { toast(`${file.name} is over 30 MB: copy it into the folder in Finder instead`, true); continue }
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    let bin = ''
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+    await run(api('upload', { project: p.id, path: (dir ? dir + '/' : '') + file.name, data: btoa(bin) }), r => `Added ${r.path}`).catch(() => {})
+  }
+  if (dir) tree.open.add(dir)
+  loadDir(dir)
+})
+
+// ── invitations pushed by other Macs ─────────────────────────────────────
+function renderInbox() {
+  const box = $('inbox')
+  const ids = new Set(S.inbox.map(i => i.id))
+  for (const el of [...box.children]) if (!ids.has(el.dataset.id)) el.remove()
+  for (const i of S.inbox) {
+    if (box.querySelector(`[data-id="${CSS.escape(i.id)}"]`)) continue
+    box.insertAdjacentHTML('beforeend', `<div class="inv" data-id="${esc(i.id)}" role="dialog" aria-label="Invitation from ${esc(i.from)}">
+      <div class="top">${avatar(i.from, true, 'lg')}<div style="flex:1;min-width:0"><b>${esc(i.from)} invites you to ${esc(i.project)}</b><p>Enter the code shown on ${esc(i.from)}’s screen.</p></div>
+        <button class="btn quiet icon sm" data-act="dismiss" data-id="${esc(i.id)}" aria-label="Dismiss">${icon('x', 'sm')}</button></div>
+      <div class="row2"><input class="field" maxlength="8" placeholder="ABC-123" autocomplete="off" spellcheck="false" aria-label="Invite code" data-code="${esc(i.id)}"><button class="btn primary" data-act="accept" data-id="${esc(i.id)}">Join</button></div>
+    </div>`)
+    box.querySelector(`[data-code="${CSS.escape(i.id)}"]`)?.focus()
+  }
+}
+
+// ── sheets ───────────────────────────────────────────────────────────────
+function open(m) { modal = m; renderModal() }
+function close() { modal = null; $('modal').innerHTML = '' }
+function renderModal() {
+  if (!modal) return
+  const focused = document.activeElement?.id
+  const views = { new: newProject, join: joinSheet, invite: inviteSheet, conflict: conflictSheet, newfile: newFileSheet, history: historySheet, deleted: deletedSheet }
+  const still = $('modal').firstChild ? 'animation:none' : '' // only animate the first appearance
+  $('modal').innerHTML = `<div class="overlay" data-act="overlay" style="${still}"><div class="sheet ${modal.wide ? 'wide' : ''}" role="dialog" aria-modal="true" style="${still}">${views[modal.type]()}</div></div>`
+  if (focused && $(focused)) { const f = $(focused), v = f.value; f.focus(); f.value = ''; f.value = v }
+  else document.querySelector('#modal .field')?.focus()
+}
+const head = (title, sub = '', below = '') => `<div class="sheet-h"><div><h3>${title}</h3>${sub ? `<p>${sub}</p>` : ''}${below}</div><button class="btn quiet icon sm" data-act="close" aria-label="Close">${icon('x', 'sm')}</button></div>`
+const steps = n => `<div class="steps">${[1, 2, 3].map(i => `<i class="${n >= i ? 'on' : ''}"></i>`).join('')}</div>`
+
+function newProject() {
+  const m = modal
+  if (m.step === 1) return head('New project', 'Choose the folder to share. Its name becomes the project name.', steps(1)) + `<div class="sheet-b">
+      <div class="pathrow">
+        <input class="field mono" id="np-dir" value="${esc(m.dir)}" placeholder="~/HackHack" spellcheck="false" autocomplete="off" aria-label="Folder path">
+        <button class="btn" data-act="pick-folder" ${m.picking ? 'disabled' : ''}>${icon('folder', 'sm')}${m.picking ? 'Waiting for Finder…' : 'Choose in Finder…'}</button>
+      </div>
+      <div id="np-note">${folderNote(m)}</div>
+      <div class="list" id="np-list" style="max-height:248px">${folderList(m)}</div>
+    </div><div class="sheet-f"><span class="note">Type a path, pick a folder below, or use Finder.</span><button class="btn primary" data-act="np-next1" ${m.busy ? 'disabled' : ''}>${m.busy ? 'Checking…' : 'Continue'}</button></div>`
+  if (m.step === 2) {
+    const ic = { ok: ['check', 'var(--ok)'], safe: ['lock', 'var(--ok)'], skip: ['minus', 'var(--text-3)'], info: ['link', 'var(--calm)'], warn: ['alert', 'var(--warn)'] }
+    return head(`Share ${esc(m.dir.split('/').pop())}?`, 'Here is what your teammates will receive.', steps(2)) + `<div class="sheet-b">
+      <div class="plines">${m.preview.lines.map(([k, t]) => `<div class="pline"><span style="color:${ic[k][1]}">${icon(ic[k][0], 'sm')}</span><span class="${k === 'skip' ? 't3' : ''}">${esc(t)}</span></div>`).join('')}</div>
+      <div class="subhead">Top level</div>
+      <div class="list" style="max-height:240px">${m.preview.entries.map(e => `<div class="li"><span class="t3" style="display:grid">${icon(e.dir ? 'folder' : 'file', 'sm')}</span><span style="flex:1" class="${e.shared ? '' : 't3'}">${esc(e.name)}</span>
+        ${e.secret ? `<span class="t3" style="font-size:var(--fs-xs);display:inline-flex;gap:4px;align-items:center">${icon('lock', 'sm')}stays here</span>` : `<button class="switch ${e.shared ? 'on' : ''}" role="switch" aria-checked="${e.shared}" aria-label="Share ${esc(e.name)}" data-act="np-share" data-path="${esc(e.path)}" data-dir="${e.dir ? 1 : ''}" data-shared="${e.shared ? '' : 1}"></button>`}</div>`).join('')}</div>
+    </div><div class="sheet-f"><button class="btn" data-act="np-back">Back</button><button class="btn primary" data-act="np-next2">Continue</button></div>`
+  }
+  if (m.step === 3) return head('Who should join?', 'They get an invitation on their screen and type the code you’ll see.', steps(3)) + `<div class="sheet-b">
+      ${S.nearby.length ? S.nearby.map(n => `<div class="pick ${m.invite.has(n.id) ? 'on' : ''}" data-act="np-pick" data-peer="${esc(n.id)}" role="checkbox" aria-checked="${m.invite.has(n.id)}" tabindex="0"><span class="check">${m.invite.has(n.id) ? icon('check', 'sm') : ''}</span>${avatar(n.name, true)}<div style="flex:1"><b style="font-weight:550">${esc(n.name)}</b> <span class="t3">${esc(n.device)}</span></div></div>`).join('')
+        : '<p class="t2" style="margin:0 0 var(--s2)">Nobody on your network is running SyncHack. You can invite people later, or send them the code.</p>'}
+      ${m.error ? `<div class="form-note error" role="alert">${icon('alert', 'sm')}<span>${esc(m.error)}</span></div>` : ''}
+    </div><div class="sheet-f"><button class="btn" data-act="np-back">Back</button><button class="btn primary" data-act="np-create" ${m.busy ? 'disabled' : ''}>${m.busy ? 'Sharing…' : m.invite.size ? `Share and invite ${m.invite.size}` : 'Share'}</button></div>`
+  const r = m.result
+  const { code, host } = splitInvite(r.invite)
+  return head(`${esc(r.name)} is shared`, 'Teammates who join get a live copy of this folder.') + `<div class="sheet-b">
+      ${r.invited.map(i => i.code ? `<div class="result"><div style="display:flex;gap:var(--s3);align-items:center">${avatar(i.peer, true, 'lg')}<div><b>${esc(first(i.peer))}</b><div class="t2 small">has an invitation. Tell them the code:</div></div></div><span class="bigcode">${esc(i.code)}</span></div>`
+        : `<div class="result"><div><b>${esc(first(i.peer))}</b><div class="small" style="color:var(--bad-text)">${esc(i.error)}</div></div></div>`).join('')}
+      <div class="subhead">For anyone else</div>
+      <div class="invite-code"><span class="code">${esc(code)}</span><button class="btn sm" data-act="copy-text" data-text="${esc(r.invite)}">${icon('copy', 'sm')}Copy invite</button></div>
+      <div class="invite-meta"><span>Valid 48 h</span><code>${esc(host)}</code></div>
+    </div><div class="sheet-f"><span></span><button class="btn primary" data-act="close">Done</button></div>`
+}
+
+/** Under the path field: an error, "will be created", or what Continue does. */
+function folderNote(m) {
+  if (m.error) return `<div class="form-note error" role="alert">${icon('alert', 'sm')}<span>${esc(m.error)}</span></div>`
+  if (m.browse?.missing) return `<div class="form-note new">${icon('plus', 'sm')}<span><code>${esc(m.browse.missing)}</code> doesn’t exist yet: SyncHack creates it in the folder below and starts an empty project.</span></div>`
+  return `<div class="form-note">${icon('check', 'sm')}<span>An existing folder is imported after you see exactly what goes out.</span></div>`
+}
+
+/** The subfolders of the folder in the field; clicking one goes into it (and fills the field). */
+function folderList(m) {
+  const b = m.browse
+  if (!b) return '<div class="li t3">Loading…</div>'
+  return (b.parent ? `<div class="li" data-act="browse" data-dir="${esc(b.parent)}" tabindex="0"><span class="t3" style="display:grid">${icon('back', 'sm')}</span><span class="t2">Up one level</span></div>` : '')
+    + (b.entries.length ? b.entries.map(d => `<div class="li" data-act="browse" data-dir="${esc(d.path)}" tabindex="0"><span class="t3" style="display:grid">${icon('folder', 'sm')}</span>${esc(d.name)}</div>`).join('')
+      : '<div class="li t3">No subfolders. Continue shares this folder.</div>')
+}
+
+/** Refreshes the list and its note without redrawing the field, so typing is never interrupted. */
+function refreshFolder() {
+  if (modal?.type !== 'new' || modal.step !== 1) return
+  if ($('np-list')) $('np-list').innerHTML = folderList(modal)
+  if ($('np-note')) $('np-note').innerHTML = folderNote(modal)
+}
+
+function joinSheet() {
+  return head('Join a project', 'Paste the invite a teammate sent you.') + `<div class="sheet-b">
+      <input class="field mono" id="join-invite" placeholder="ABC-123@192.168.1.20:8787#…" value="${esc(modal.value ?? '')}" spellcheck="false" autocomplete="off" aria-label="Invite">
+      <p class="t3 small" style="margin:6px 0 var(--s1)">The project lands in a folder named after it, in your home folder. Invitations sent from a teammate’s screen appear bottom-right on their own.</p>
+    </div><div class="sheet-f"><span></span><button class="btn primary" data-act="join-go" ${modal.busy ? 'disabled' : ''}>${modal.busy ? 'Joining…' : 'Join'}</button></div>`
+}
+
+function inviteSheet() {
+  const p = project()
+  const people = S.nearby.filter(n => !n.projects.includes(p.id))
+  const { code, host } = splitInvite(p.invite)
+  return head(`Invite to ${esc(p.name)}`, 'Send an invitation to someone on your network, or share the code.') + `<div class="sheet-b">
+      ${people.length ? people.map(n => {
+        const sent = modal.sent?.[n.id]
+        return `<div class="result"><div style="display:flex;gap:var(--s3);align-items:center">${avatar(n.name, true, 'lg')}<div><b>${esc(n.name)}</b><div class="t3 small">${esc(n.device)}</div></div></div>
+          ${sent ? `<div style="text-align:right"><div class="t2 small">Invitation sent. Tell them:</div><span class="bigcode">${esc(sent)}</span></div>` : `<button class="btn primary sm" data-act="invite-send" data-peer="${esc(n.id)}">Send invitation</button>`}</div>`
+      }).join('') : '<p class="t2" style="margin:0">Nobody on your network who isn’t already in this project.</p>'}
+      <div class="subhead">Invite code</div>
+      <div class="invite-code"><span class="code">${esc(code)}</span><button class="btn sm" data-act="copy-invite">${icon('copy', 'sm')}Copy invite</button></div>
+      <div class="invite-meta"><span>Valid 48 h · they paste it in Join</span><code title="${esc(p.invite)}">${esc(host)}</code></div>
+    </div><div class="sheet-f"><span></span><button class="btn" data-act="close">Done</button></div>`
+}
+
+function conflictSheet() {
+  const p = project()
+  const c = p?.conflicts.find(x => x.id === modal.id)
+  if (!c) return head('Conflict resolved', 'Everyone has the chosen version now.') + `<div class="sheet-f"><span></span><button class="btn" data-act="close">Close</button></div>`
+  const votes = x => Object.values(c.votes).filter(v => v === x).length
+  let region = ''
+  const body = (modal.text ?? 'Loading both versions…').split('\n').map(l => {
+    let cls = region
+    if (l.startsWith('<<<<<<<')) { region = 'a'; cls = 'm' } else if (l.startsWith('|||||||')) { region = 'm'; cls = 'm' } else if (l.startsWith('=======')) { region = 'b'; cls = 'm' } else if (l.startsWith('>>>>>>>')) { region = ''; cls = 'm' }
+    return `<span class="${cls}">${esc(l) || ' '}</span>`
+  }).join('\n')
+  const side = (x, s, color) => `<span class="badge"><b style="color:${color}">${x}</b>${esc(s.who)}${s.deleted ? ' · deleted it' : ''}<span class="t3">· ${votes(x)} vote${votes(x) === 1 ? '' : 's'}</span></span>`
+  return head(`Conflict in <code>${esc(c.path)}</code>`, 'Both versions are safe. Pick one, or merge by hand in your editor and keep your file.') + `<div class="sheet-b">
+      <div style="display:flex;gap:var(--s2);margin-bottom:var(--s3);flex-wrap:wrap">${side('A', c.a, 'var(--side-a)')}${side('B', c.b, 'var(--side-b)')}</div>
+      <pre class="code">${body}</pre>
+    </div><div class="sheet-f"><div style="display:flex;gap:6px"><button class="btn sm" data-act="vote" data-choice="A">Vote A</button><button class="btn sm" data-act="vote" data-choice="B">Vote B</button></div>
+      <div style="display:flex;gap:var(--s2)"><button class="btn" data-act="resolve" data-choice="mine">Keep my file</button><button class="btn" data-act="resolve" data-choice="A">Keep A</button><button class="btn primary" data-act="resolve" data-choice="B">Keep B</button></div></div>`
+}
+
+function newFileSheet() {
+  return head('New file', `Created in ${esc(project().name)} and shared right away.`) + `<div class="sheet-b">
+      <input class="field mono" id="nf-path" placeholder="notes/plan.md" value="${esc(modal.path ?? '')}" spellcheck="false" aria-label="File path">
+      <div class="subhead">Content <span class="t3" style="font-weight:400">optional</span></div>
+      <textarea class="field" id="nf-content" placeholder="# Plan" spellcheck="false" aria-label="Content"></textarea>
+    </div><div class="sheet-f"><span></span><button class="btn primary" data-act="newfile-go">Create file</button></div>`
+}
+
+function historySheet() {
+  const m = modal
+  const vs = m.versions
+  const v = vs?.find(x => x.version === m.sel)
+  const pv = m.preview
+  const right = !vs ? '<p class="t3">Loading…</p>'
+    : !vs.length ? '<p class="t2">No versions yet: this file hasn’t synced.</p>'
+    : !pv ? '<p class="t3">Loading…</p>'
+    : pv.deleted ? `<p class="t2">v${m.sel} is when the file was deleted.</p>`
+    : pv.same ? `<p class="t2">v${m.sel} matches the file on your Mac.</p>`
+    : pv.binary ? `<p class="t2">Binary file, ${(pv.size / 1024).toFixed(1)} KB. No preview, but it can be restored.</p>`
+    : pv.tooBig ? '<p class="t2">Too different to show line by line, but it can be restored.</p>'
+    : `<div class="subhead" style="margin-top:0">Restoring v${m.sel} changes your file: <span style="color:var(--bad-text)">− removed</span> · <span style="color:#8fd3a5">+ added</span></div><pre class="code diff">${pv.diff.map(r => `<span class="${{ '-': 'del', '+': 'add', '…': 'fold', '=': '' }[r.t]}">${{ '-': '− ', '+': '+ ', '…': '  ', '=': '  ' }[r.t]}${esc(r.s) || ' '}</span>`).join('')}</pre>`
+  const canRestore = v && v.hash && pv && !pv.deleted && !pv.same && m.sel !== vs[0].version
+  return head(`History of <code>${esc(m.path)}</code>`, 'Every saved version. Restoring adds a new version, so it can always be undone.') + `<div class="sheet-b"><div class="hist-layout">
+      <div class="list">${(vs ?? []).map((x, i) => `<div class="li ver ${x.version === m.sel ? 'on' : ''}" data-act="hist-pick" data-v="${x.version}" tabindex="0"><b>v${x.version}</b>${i === 0 ? '<span class="tag">Current</span>' : ''}${x.hash ? '' : '<span class="tag muted">Deleted</span>'}
+        <span class="by">${esc(x.author)} · ${when(x.at)}</span></div>`).join('')}</div>
+      <div style="min-width:0">${right}</div>
+    </div></div><div class="sheet-f"><span class="note">The team receives the restored file as a new version.</span>
+      <button class="btn primary" data-act="hist-restore" ${canRestore && !m.busy ? '' : 'disabled'}>${m.busy ? 'Restoring…' : v ? `Restore v${m.sel}` : 'Restore'}</button></div>`
+}
+
+function deletedSheet() {
+  const files = modal.files
+  return head('Deleted files', 'Bring a file back with its last content.') + `<div class="sheet-b">
+      ${!files ? '<p class="t3">Loading…</p>' : !files.length ? '<p class="t2" style="margin:0 0 var(--s2)">Nothing has been deleted in this project.</p>' : `<div class="list">${files.map(f => `<div class="li" style="min-height:44px"><span class="t3" style="display:grid">${icon('file', 'sm')}</span><div style="flex:1;min-width:0"><code style="overflow-wrap:anywhere">${esc(f.path)}</code><div class="t3 small">Deleted by ${esc(f.author)} · ${when(f.at)}</div></div>
+        <button class="btn quiet sm" data-act="deleted-history" data-path="${esc(f.path)}">History</button><button class="btn sm" data-act="restore-deleted" data-path="${esc(f.path)}">Restore</button></div>`).join('')}</div>`}
+    </div><div class="sheet-f"><span></span><button class="btn" data-act="close">Done</button></div>`
+}
+
+// ── actions ──────────────────────────────────────────────────────────────
+const actions = {
+  select: el => { sel = el.dataset.id; sessionStorage.setItem('sel', sel); render() },
+  new: () => { open({ type: 'new', step: 1, dir: '~/HackHack', invite: new Set(), live: true }); browse('~/HackHack') },
+  join: () => open({ type: 'join' }),
+  invite: () => open({ type: 'invite', sent: {}, live: true }),
+  close, overlay: (el, e) => { if (e.target === el) close() },
+  mode: el => run(api('mode', { project: project().id, mode: el.dataset.mode }), { live: 'Live: changes go out as you save', calm: 'Calm: changes are batched', paused: 'Paused: working locally' }[el.dataset.mode]),
+  finder: () => api('open', { project: project().id }),
+  reveal: el => run(api('open', { project: project().id, path: el.dataset.path }), 'Shown in Finder'),
+  'open-folder': el => api('open', { project: project().id, path: el.dataset.path, inside: true }),
+  'copy-invite': () => copy(project().invite, 'Invite copied'),
+  'copy-text': el => copy(el.dataset.text, 'Copied'),
+  'copy-install': (el, e) => { e.preventDefault(); copy(S.hosting.install, 'Install command copied. Your teammate pastes it into Terminal.') },
+  'new-code': () => run(api('refreshInvite', { project: project().id }), 'New invite code. The previous one no longer works.'),
+  'invite-one': el => { open({ type: 'invite', sent: {}, live: true }); actions['invite-send'](el) },
+  'invite-send': el => {
+    const peer = el.dataset.peer
+    el.disabled = true
+    run(api('invite', { project: project().id, peer }), `Invitation sent to ${first(peer)}`).then(r => { if (modal?.type === 'invite') { modal.sent[peer] = r.code; renderModal() } }, () => (el.disabled = false))
+  },
+  accept: el => {
+    const code = document.querySelector(`[data-code="${CSS.escape(el.dataset.id)}"]`).value
+    el.disabled = true
+    run(api('accept', { id: el.dataset.id, code }), r => `Joined ${r.name}. Files are arriving in ${r.root}`).then(r => { sel = r.id; render() }, () => (el.disabled = false))
+  },
+  dismiss: el => api('dismiss', { id: el.dataset.id }),
+  'flag-ok': el => api('dismissFlag', { project: project().id, path: el.dataset.path }),
+  'toggle-dir': el => { const d = el.dataset.path; tree.open.has(d) ? tree.open.delete(d) : (tree.open.add(d), loadDir(d)); if ($('tree')) $('tree').innerHTML = treeHtml(project()) },
+  'refresh-files': () => { for (const d of tree.open) loadDir(d) },
+  share: el => {
+    const path = el.dataset.path, shared = !!el.dataset.shared
+    run(api('share', { project: project().id, path, dir: !!el.dataset.dir, shared }), shared ? `${path} is shared with the team` : `${path} now stays on this Mac`)
+      .then(() => loadDir(path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''), () => {})
+  },
+  newfile: () => open({ type: 'newfile' }),
+  'newfile-go': () => {
+    const path = $('nf-path').value.trim(), content = $('nf-content').value
+    run(api('newFile', { project: project().id, path, content }), r => `Created ${r.path}`).then(r => {
+      close()
+      const parts = r.path.split('/').slice(0, -1)
+      for (let i = 1; i <= parts.length; i++) tree.open.add(parts.slice(0, i).join('/'))
+      loadDir('')
+      for (let i = 1; i <= parts.length; i++) loadDir(parts.slice(0, i).join('/'))
+    }, () => {})
+  },
+  'join-go': () => {
+    modal.value = $('join-invite').value
+    modal.busy = true
+    renderModal()
+    run(api('join', { invite: modal.value }), r => `Joined ${r.name}. Files are arriving in ${r.root}`).then(r => { close(); sel = r.id; render() }, () => { modal.busy = false; renderModal() })
+  },
+  conflict: el => { open({ type: 'conflict', id: el.dataset.id, wide: true, live: true }); api('conflictText', { project: project().id, id: el.dataset.id }).then(r => { if (modal?.id === el.dataset.id) { modal.text = r.text; renderModal() } }, e => toast(e.message, true)) },
+  vote: el => run(api('vote', { project: project().id, id: modal.id, choice: el.dataset.choice }), `Voted ${el.dataset.choice}`),
+  resolve: el => run(api('resolve', { project: project().id, id: modal.id, choice: el.dataset.choice }), 'Resolved. Everyone gets that version now.').then(close, () => {}),
+  history: el => openHistory(el.dataset.path),
+  'deleted-history': el => openHistory(el.dataset.path),
+  'hist-pick': el => pickVersion(Number(el.dataset.v)),
+  'hist-restore': () => {
+    const { path, sel: v } = modal
+    modal.busy = true
+    renderModal()
+    run(api('restoreVersion', { project: project().id, path, version: v }), `${path} is back to v${v}. Open its history to undo.`)
+      .then(() => { close(); loadDir(path.split('/').slice(0, -1).join('/')) }, () => { modal.busy = false; renderModal() })
+  },
+  deleted: () => { open({ type: 'deleted' }); api('deleted', { project: project().id }).then(r => { if (modal?.type === 'deleted') { modal.files = r.files; renderModal() } }, e => toast(e.message, true)) },
+  'restore-deleted': el => run(api('restoreDeleted', { project: project().id, path: el.dataset.path }), r => `${r.path} is back`).then(() => { modal.files = modal.files.filter(f => f.path !== el.dataset.path); renderModal(); loadDir('') }, () => {}),
+  // new project
+  browse: el => browse(el.dataset.dir),
+  'pick-folder': async () => {
+    modal.picking = true
+    modal.error = null
+    renderModal()
+    try {
+      const { path } = await api('pickFolder', { dir: $('np-dir')?.value.trim() || modal.dir })
+      if (modal?.type !== 'new') return
+      modal.picking = false
+      if (!path) return renderModal() // cancelled in Finder
+      await browse(path)
+      return actions['np-next1']() // a folder picked in Finder: straight to what will be shared
+    } catch (e) {
+      if (modal?.type !== 'new') return
+      modal.picking = false
+      modal.error = e.message
+      renderModal()
+    }
+  },
+  'np-next1': async () => {
+    if (modal.busy) return
+    modal.dir = ($('np-dir')?.value ?? modal.dir).trim() || '~/HackHack'
+    modal.busy = true
+    modal.error = null
+    renderModal()
+    try {
+      const preview = await api('preview', { dir: modal.dir })
+      if (modal?.type !== 'new') return
+      modal.preview = preview
+      modal.step = preview.exists && !preview.empty ? 2 : 3
+    } catch (e) {
+      if (modal?.type !== 'new') return
+      modal.error = e.message // shown under the field, where the problem is
+    }
+    modal.busy = false
+    renderModal()
+  },
+  'np-share': el => run(api('share', { root: modal.dir, path: el.dataset.path, dir: !!el.dataset.dir, shared: !!el.dataset.shared })).then(() => api('preview', { dir: modal.dir })).then(p => { modal.preview = p; renderModal() }, () => {}),
+  'np-next2': () => { modal.step = 3; renderModal() },
+  'np-back': () => { modal.step = modal.step === 3 && modal.preview?.exists && !modal.preview.empty ? 2 : 1; renderModal() },
+  'np-pick': el => { const id = el.dataset.peer; modal.invite.has(id) ? modal.invite.delete(id) : modal.invite.add(id); renderModal() },
+  'np-create': () => {
+    modal.busy = true
+    renderModal()
+    modal.error = null
+    api('create', { dir: modal.dir, invite: [...modal.invite] }).then(r => { sel = r.id; sessionStorage.setItem('sel', sel); modal.step = 4; modal.result = r; modal.live = false; renderModal(); render() }, e => { modal.busy = false; modal.error = e.message; renderModal() })
+  },
+}
+
+async function openHistory(path) {
+  open({ type: 'history', path, wide: true })
+  try {
+    const { versions } = await api('history', { project: project().id, path })
+    if (modal?.path !== path) return
+    modal.versions = versions
+    renderModal()
+    if (versions.length) pickVersion(versions[1]?.version ?? versions[0].version) // the one before now
+  } catch (e) { toast(e.message, true) }
+}
+async function pickVersion(v) {
+  const path = modal.path
+  modal.sel = v
+  modal.preview = null
+  renderModal()
+  try {
+    const preview = await api('version', { project: project().id, path, version: v })
+    if (modal?.path === path && modal.sel === v) { modal.preview = preview; renderModal() }
+  } catch (e) { toast(e.message, true) }
+}
+/** Goes into a folder: the list and the path field both show it. */
+async function browse(dir) {
+  try {
+    const b = await api('browse', { dir })
+    if (modal?.type !== 'new') return
+    modal.browse = b
+    modal.dir = b.missing ?? b.dir // a new folder's path stays as typed; an existing one is selected
+    modal.error = null
+  } catch (e) {
+    if (modal?.type !== 'new') return
+    modal.error = e.message
+  }
+  renderModal()
+}
+
+let typing
+/** While a path is typed: follow it in the list (quietly; half-typed paths are normal). */
+function followTyping(value) {
+  clearTimeout(typing)
+  typing = setTimeout(async () => {
+    try {
+      const b = await api('browse', { dir: value.trim() || '~' })
+      if (modal?.type !== 'new' || ($('np-dir')?.value ?? '') !== value) return // typed on meanwhile
+      modal.browse = b
+    } catch {
+      return // e.g. a file path: keep the last listing
+    }
+    refreshFolder()
+  }, 250)
+}
+
+document.addEventListener('click', e => {
+  const el = e.target.closest('[data-act]')
+  if (el && actions[el.dataset.act]) actions[el.dataset.act](el, e)
+})
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && modal) return close()
+  const t = e.target
+  if (e.key === 'Enter' && t.matches?.('[data-code]')) return actions.accept(document.querySelector(`[data-act="accept"][data-id="${CSS.escape(t.dataset.code)}"]`))
+  if (e.key === 'Enter' && t.id === 'join-invite') return actions['join-go']()
+  if (e.key === 'Enter' && t.id === 'np-dir') return actions['np-next1']()
+  if ((e.key === 'Enter' || e.key === ' ') && t.matches?.('[tabindex][data-act]')) { e.preventDefault(); return t.click() }
+  if (modal || t.matches?.('input, textarea')) return
+  if (e.metaKey && e.key.toLowerCase() === 'n') { e.preventDefault(); actions.new() } // ⌘N
+})
+document.addEventListener('input', e => {
+  if (e.target.id !== 'np-dir' || !modal) return
+  modal.dir = e.target.value
+  if (modal.error) { modal.error = null; refreshFolder() }
+  followTyping(e.target.value)
+})
+setInterval(() => { if (S && !modal) renderMain() }, 20000) // keeps "2m" fresh
+
+if (!token) document.body.innerHTML = `<div class="gone"><div>${icon('terminal')}<h2>Open SyncHack from Terminal</h2><p>Type <code>/synchack</code>. It opens this window with its access key.</p></div></div>`
+else connect()
+</script>
+</body>
+</html>

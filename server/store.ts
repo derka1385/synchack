@@ -62,6 +62,15 @@ export class Store {
     const cols = new Set(this.all<{ name: string }>('pragma table_info(projects)').map(c => c.name))
     if (!cols.has('owner')) this.db.exec('alter table projects add column owner text')
     if (!cols.has('code_expires')) this.db.exec(`alter table projects add column code_expires integer not null default ${Date.now() + INVITE_TTL}`)
+    // paths folded to lower case: on a Mac, A.txt and a.txt are the same file (see applyOp)
+    if (!this.all<{ name: string }>('pragma table_info(heads)').some(c => c.name === 'fold')) {
+      this.db.exec('alter table heads add column fold text')
+      this.tx(() => {
+        for (const h of this.all<{ project: string; path: string }>('select project, path from heads'))
+          this.run('update heads set fold = ? where project = ? and path = ?', fold(h.path), h.project, h.path)
+      })
+    }
+    this.db.exec('create index if not exists heads_by_fold on heads (project, fold)')
   }
 
   private one<T>(sql: string, ...args: SQLInputValue[]) {
@@ -99,7 +108,7 @@ export class Store {
 
   private newCode() {
     let code: string
-    do code = Array.from({ length: 6 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join('').replace(/^(...)/, '$1-')
+    do code = Array.from({ length: 8 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join('').replace(/^(....)/, '$1-')
     while (this.one('select 1 from projects where code = ?', code))
     return code
   }
@@ -110,7 +119,8 @@ export class Store {
    * teammate's identity by joining with their (visible) device id.
    */
   join(code: string, who: Omit<Device, 'project'>, token: string | null = null) {
-    const clean = code.toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^(...)/, '$1-')
+    const raw = code.toUpperCase().replace(/[^A-Z0-9]/g, '')
+    const clean = raw.length === 8 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : raw.replace(/^(...)/, '$1-')
     const p = this.one<{ id: string; name: string; code: string }>('select id, name, code from projects where code = ? and code_expires > ?', clean, Date.now())
     if (!p) return undefined
     const known = this.one<{ token: string }>('select token from members where project = ? and device = ?', p.id, who.device)
@@ -145,7 +155,20 @@ export class Store {
     return device === m.device ? undefined : this.invite(m.project, true)
   }
 
+  /**
+   * Display names are unique within a project (case and width folded): a teammate can't appear
+   * as "Nolann" next to Nolann. The second one becomes "Nolann 2".
+   */
+  private uniqueName(project: string, device: string, name: string) {
+    const key = (s: string) => s.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim()
+    const taken = new Set(this.all<{ name: string }>('select name from members where project = ? and device <> ?', project, device).map(r => key(r.name)))
+    let out = name
+    for (let i = 2; taken.has(key(out)); i++) out = `${name.slice(0, 190)} ${i}`
+    return out
+  }
+
   private addMember(m: Device) {
+    m = { ...m, name: this.uniqueName(m.project, m.device, m.name) }
     const token = randomId(32) // stored hashed; joining again from the same device rotates it
     this.run(
       `insert into members (project, device, name, device_name, token, joined) values (?, ?, ?, ?, ?, ?)
@@ -274,7 +297,8 @@ export class Store {
     return { results, events }
   }
 
-  private applyOp(m: Device, op: Op): { result: OpResult; head?: Head; conflict?: Conflict } {
+  private applyOp(m: Device, raw: Op): { result: OpResult; head?: Head; conflict?: Conflict } {
+    const op = { ...raw, opId: `${m.device}\n${raw.opId}` }
     const path = cleanPath(op.path)
     const head = this.head(m.project, path)
     const now = { version: head.version, hash: head.hash }
@@ -289,6 +313,10 @@ export class Store {
     if (open) return { result: { status: 'blocked', conflictId: open.id, ...now } }
     if (op.hash && !this.hasBlob(m.project, op.hash)) throw new Error(`content ${op.hash} was not uploaded`)
 
+    if (head.hash === null && op.hash !== null) {
+      const twin = this.one<{ path: string }>('select path from heads where project = ? and fold = ? and path <> ? and hash is not null limit 1', m.project, fold(path), path)
+      if (twin) throw new Error(`"${path}" differs from "${twin.path}" only in letter case: on a Mac they are the same file. Rename one of them.`)
+    }
     if (op.baseHash === head.hash) {
       const h = this.commit(m, path, op.hash, op.opId) // fast-forward
       return { result: { status: 'ok', version: h.version, hash: h.hash }, head: h }
@@ -341,10 +369,10 @@ export class Store {
     const { seq } = this.one<{ seq: number }>('update projects set seq = seq + 1 where id = ? returning seq', m.project)!
     const h: Head = { path, version: this.head(m.project, path).version + 1, hash, seq, device: m.device, author: label(m), at: Date.now() }
     this.run(
-      `insert into heads (project, path, version, hash, seq, device, author, at) values (?, ?, ?, ?, ?, ?, ?, ?)
+      `insert into heads (project, path, version, hash, seq, device, author, at, fold) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
        on conflict (project, path) do update set version = excluded.version, hash = excluded.hash, seq = excluded.seq,
        device = excluded.device, author = excluded.author, at = excluded.at`,
-      m.project, path, h.version, hash, seq, m.device, h.author, h.at,
+      m.project, path, h.version, hash, seq, m.device, h.author, h.at, fold(path),
     )
     this.run('insert into versions (project, path, version, hash, device, author, op, at) values (?, ?, ?, ?, ?, ?, ?, ?)', m.project, path, h.version, hash, m.device, h.author, op, h.at)
     return h
@@ -411,6 +439,9 @@ export class Store {
     return c
   }
 }
+
+/** How APFS compares names: NFC and case-insensitive. */
+const fold = (path: string) => path.normalize('NFC').toLowerCase()
 
 function lineCount(s: string) {
   let n = 0

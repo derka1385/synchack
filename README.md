@@ -22,7 +22,7 @@ synchack        # opens the terminal interface
 ```
 
 1. **The creator** presses `n` and gives a folder (new or existing; its name becomes the project
-   name). Their Mac now hosts the project, and an invite like `HX7-K92@192.168.1.129:8787#k3Jq…`
+   name). Their Mac now hosts the project, and an invite like `HX7K-92QM@192.168.1.129:8787#k3Jq…`
    is copied to the clipboard. The part after `#` identifies the creator's Mac (see Security).
    Invites work for 48 hours; `i` copies a fresh one.
 2. **Teammates** run `synchack`, press `j` and paste the invite. The project lands in
@@ -34,11 +34,14 @@ The interface shows each project, who is online, which files each teammate chang
 Keys: `n` share · `j` join · `i` copy invite · `u` copy install command · `l`/`c`/`p` live/calm/pause · `o` Finder · `x` conflicts · `q` quit.
 
 Keep it open while you work: it is what syncs, and on the creator's Mac it is also the server.
+To end the session, press `q`, close the Terminal window, or run `synchack stop` from any
+terminal (it stops a synchack running elsewhere, even one whose window you lost).
 Without the interface: `synchack create [dir]`, `synchack join INVITE [dir]`, `synchack run`.
 
 | Command | What it does |
 |---|---|
 | `synchack status` | Projects, online/offline, pending files, teammates, open conflicts, errors |
+| `synchack stop` | Stop synchack on this Mac; files stay as they are |
 | `synchack live` / `calm` / `pause` `[dir]` | Switch modes (see below) |
 | `synchack conflicts` / `show ID` / `vote ID A\|B` / `resolve ID A\|B\|mine` | Review and settle conflicts |
 | `synchack open [dir]` | Open the folder in Finder |
@@ -46,6 +49,11 @@ Without the interface: `synchack create [dir]`, `synchack join INVITE [dir]`, `s
 | `synchack members` / `remove NAME` / `leave` | List teammates; the creator removes one (this also replaces the invite); leave a project |
 | `synchack history PATH` / `restore [PATH] [--version N]` | A file's versions; bring back missing files, or an old version of one |
 | `synchack backup DEST` | Copy everything this Mac hosts, with full history |
+
+**A teammate without synchack** pastes the install command (`u` in the terminal view, or the
+Terminal icon in the app) into Terminal. It downloads synchack and its packages from your Mac in one
+piece, with a progress bar, so it needs Node 24+ but neither npm nor the internet. Running it again
+updates.
 
 The creator's Mac hosts on port 8787 (`SYNCHACK_PORT` to change; if a synchack server already
 runs there, it is used). To use a separate server instead, e.g. a small VM, pass
@@ -59,6 +67,32 @@ If a teammate can't connect, run `curl -k https://<creator-ip>:8787/health` on t
 `{"ok":true}` means the network is fine. If it hangs, the Macs can't see each other: they are on
 different networks, or the Wi-Fi isolates devices (common on school, eduroam and hotel
 networks). A phone hotspot or Tailscale fixes that.
+
+## The app
+
+`synchack` opens the app in your browser; the terminal view keeps running alongside (`w` reopens
+the app, `--no-browser` skips it, `--no-discover` keeps this Mac off the Wi-Fi list).
+
+- **Projects and people:** your projects with their sync state, and everyone on the same Wi-Fi
+  who runs synchack (Bonjour).
+- **New project:** pick a folder, see exactly what will be shared (secrets, `.git`, virtualenvs,
+  caches and local databases stay on your Mac) and switch items off, then tick who to invite.
+- **Invitations:** the person you pick gets an invitation on their screen and types the code shown
+  on yours. The code is bound to that invitation (scrypt), so someone on the same Wi-Fi can't
+  forge one, and invitations travel over TLS pinned through the Bonjour record. The paste-able
+  invite still works for anyone not nearby.
+- **Team:** who is online, which files each person changed recently, what you're editing now, and
+  a heads-up when two people change the same file within 10 minutes.
+- **Files:** the project tree with a switch per file or folder (shared, or kept on this Mac by
+  writing `.synchackignore`, which the team shares), new files, and drag-and-drop to add files.
+- **Conflicts:** both versions with markers, votes, and keep A / keep B / keep my file.
+- **Changes to review:** when a teammate changes a file your tools run (`package.json`,
+  `.claude/`, `Makefile`…) or sync rules that stop files from syncing, the project shows a notice
+  until you dismiss it; "Review change" opens the file's history. A project that syncs over plain
+  HTTP is marked "Not encrypted".
+
+The app talks to a server on `127.0.0.1` only, with a random token per launch and a Host check,
+so other web pages in the same browser can't drive it.
 
 ## Architecture
 
@@ -98,6 +132,7 @@ client-core/net.ts    HTTP(S) requests, certificate pinning, the hosting Mac's T
 client-core/engine.ts ProjectSync: watcher, debounce, upload, download, reconnect, conflicts
 client-core/hub.ts    syncs every project on this Mac, hosts the ones created here, invites
 client-core/tui.ts    the terminal interface (Ink)
+client-core/ui-server.ts, ui/index.html  the browser app and its local API
 client-core/cli.ts    the synchack command
 test/                 unit tests (merge, paths) and end-to-end sync tests
 ```
@@ -111,7 +146,7 @@ POST /api/projects  {name, device, user, deviceName}  → {projectId, code, toke
 POST /api/join      {code, device, user, deviceName}  → {projectId, name, code, token}
 ```
 
-The join code (`HX7-K92`) is not the project ID: project IDs are 128-bit random. Codes expire
+The join code (`HX7K-92QM`) is not the project ID: project IDs are 128-bit random. Codes expire
 after 48 hours. Each device gets its own 256-bit token, and the server stores only its hash. A
 device that is already a member can only join again with its current token. Every call below
 needs `Authorization: Bearer <token>`, and membership is checked on every request.
@@ -195,21 +230,32 @@ fails if a file appeared in the meantime.
 
 ## Ignore rules and secrets
 
-Built in, always active:
+Built in, always active, matched without regard to letter case (like APFS and git on macOS):
 
 ```
-node_modules/  dist/  build/  .next/  coverage/  *.log  .DS_Store
-.env  .env.*  *.pem  *.key          ← secrets stay on the Mac that has them
-._*  *.swp  *~                      ← OS/editor litter
-.git/  .synchack/                   ← never synced, cannot be overridden
+node_modules/  dist/  build/  .next/  coverage/  *.log  .DS_Store   ← build output and litter
+.venv/  __pycache__/  .pytest_cache/  *.db  *.sqlite …               ← per-machine environments, local databases
+.git/  .synchack/                                                    ← never synced, no rule can change that
 ```
 
-A `.synchackignore` at the project root adds gitignore-style rules (`*`, `**`, `?`, trailing `/`
-for folders, leading `/` to anchor). It is synced, so the whole team shares it. A `!` line
-re-includes a file, e.g. `!.env.example`. Ignored means invisible both ways: an ignored file is
-never uploaded, and a teammate's file at an ignored path is never written here. Because the file
-is shared, `!.env` would upload every teammate's `.env`, so don't. Git keeps working
-independently: every Mac can still `git commit`/`push`, and sync never creates commits.
+Secrets never leave the Mac that has them, and **no rule can re-include them**:
+
+```
+.env  .env.*  *.pem  *.key  *.p12  *.pfx  *.keystore  *.jks
+id_rsa  id_dsa  id_ecdsa  id_ed25519  .netrc  .pgpass  .ssh/  .aws/  .gnupg/
+```
+
+Templates such as `.env.example`, `.env.sample` and `.env.template` are not secrets and sync
+normally. A `.synchackignore` at the project root adds gitignore-style rules (`*`, `**`, `?`,
+trailing `/` for folders, leading `/` to anchor). It is synced, so the whole team shares it, and
+a `!` line re-includes an ignored file, but never a secret. That way a teammate can't add `!.env`
+to collect everyone's keys. Ignored means invisible both ways: an ignored file is never uploaded,
+and a teammate's file at an ignored path is never written here.
+
+Files a teammate deletes are moved to `.synchack/trash/<date>/` on this Mac, not erased, and
+kept for 7 days. Every version also stays on the host (`synchack history`, `synchack restore`).
+Git keeps working independently: every Mac can still `git commit`/`push`, and sync never
+creates commits. See [SECURITY_AUDIT.md](SECURITY_AUDIT.md) for the threat model.
 
 ## Modes
 
@@ -244,13 +290,20 @@ while the file was held are merged on top of the resolution, never dropped.
   create attempts are limited to 20 per address per 10 minutes, and a hosting Mac only lets itself
   create projects. Nobody can take over a teammate by reusing their device id.
 - **Members.** The creator removes a teammate with `synchack remove NAME`: their token stops
-  working, their connection is closed, and the invite is replaced.
+  working, their connection is closed, and the invite is replaced. Names are unique within a
+  project, ignoring case and width: a second "Nolann" appears as "Nolann 2".
 - **Limits.** Uploads stream to disk (100 MB per file, 16 at once) and count against a 5 GB quota
   per project (`SYNCHACK_QUOTA_GB` on a separate server). JSON bodies are capped at 2 MB, ops at
-  1000 per request, WebSocket messages from clients at 4 KB.
+  1000 per request, WebSocket messages from clients at 4 KB. Each member's device gets 50 000 file
+  changes and 60 connections per 10 minutes, 3 open connections and 8 uploads at once.
 - **Files that run.** Any member can change any synced file, including ones agents and tools
   execute (`.claude/`, `.vscode/`, `.github/workflows/`, `package.json`, `Makefile`, `.envrc`,
-  `CLAUDE.md`…). Such changes from teammates are flagged with ⚠ in the activity log.
+  `CLAUDE.md`…), in any letter case. Such changes from teammates wait in the app for review (see
+  The app) and are marked ⚠ in the activity log. So are shared ignore rules that hide files.
+- **Discovery.** Bonjour announces "Name (Mac name)" and the host's key hash on the local network.
+  `--no-discover` (or `SYNCHACK_DISCOVER=0`) turns it off; teammates then join with the invite
+  text. Someone on the Wi-Fi can send invitation cards, but at most 3 per address, never replacing
+  another address's, and a forged one can't be joined.
 - **Logs.** The server logs one line per request, never tokens, to stdout or, on a hosting Mac,
   `$SYNCHACK_HOME/server.log`. Unexpected errors are logged in full and reported to clients only
   as "internal server error".
@@ -263,6 +316,8 @@ while the file was held are merged on top of the resolution, never dropped.
 - If the project folder disappears (moved, unmounted), sync stops. It is never read as "everything was deleted".
 - A file replaced by a folder (or the reverse), folder moves, and case-only renames on APFS
   (`uno.ts` → `Uno.ts`) propagate correctly.
+- Two files whose names differ only in letter case (`Notes.md`, `notes.md`) are one file on a Mac,
+  so the server refuses the second one and asks to rename it.
 - Synced files are never executed by synchack.
 - Blobs are flushed to disk before they are committed, so a power cut can't leave a version
   pointing at an empty file.
@@ -279,7 +334,7 @@ is built into Node: `node:sqlite`, `fs.watch` (FSEvents on macOS), `node:https`,
 
 ## Tests
 
-`npm test` runs 42 tests, including the terminal interface driven like a user. The end-to-end tests run a real server and one temp
+`npm test` runs 73 tests, including the terminal interface driven like a user. The end-to-end tests run a real server and one temp
 folder with its own state DB per "Mac", with real FSEvents. They cover:
 
 - Import with Unicode and space-containing names, nested folders, binaries and ignores; join; edits both ways
@@ -310,7 +365,6 @@ merge identities, CRLF/BOM handling, and a 20 000-line merge.
 - Empty folders, file permissions (the executable bit), and symlinks are not synced. Files over
   100 MB are skipped and listed in `synchack status`.
 - Switching git branches inside a synced folder changes everyone's files. Pause first, or agree on it.
-- Two different files whose names differ only by case, created on two Macs, are not detected as a clash.
 - One server process with SQLite (move to Postgres before running several instances).
 - Blobs are never deleted, so a project's storage only grows until its quota.
 

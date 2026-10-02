@@ -1,17 +1,19 @@
 // The background half of synchack: syncs every project on this Mac and hosts the ones
 // created here. Used by the terminal UI and by `synchack run`.
 import { EventEmitter } from 'node:events'
-import { spawn, type ChildProcess } from 'node:child_process'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { homedir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
-import { startServer, type Server } from '../server/server.ts'
-import { lanAddresses, sha256, type Conflict, type Hash } from '../shared/protocol.ts'
+import { startServer, type Inbound, type Server } from '../server/server.ts'
+import { MAX_FILE, lanAddresses, sha256, type Conflict, type Hash } from '../shared/protocol.ts'
+import { ignoreRules, printable, secret } from '../shared/paths.ts'
 import { decode, isText, merge3 } from '../shared/merge.ts'
 import { cleanPath } from '../shared/paths.ts'
 import { ProjectSync, call, createProject, joinProject, type SyncOptions } from './engine.ts'
 import type { LocalState, Project } from './state.ts'
-import { hostIdentity, pinOf, request, urlPin } from './net.ts'
+import { hostIdentity, pinOf, pinnedCert, request, stdPin, urlPin } from './net.ts'
 
 export const DEFAULT_PORT = 8787
 const LOOPBACK = ['localhost', '127.0.0.1', '[::1]']
@@ -28,7 +30,7 @@ export function inviteFor(p: Pick<Project, 'code' | 'server'> & { cert?: string 
 }
 
 export function parseInvite(invite: string) {
-  const m = invite.trim().match(/^([A-Za-z0-9]{3}-?[A-Za-z0-9]{3})@([^\s#]+)(?:#([\w+/=-]{43,44}))?$/)
+  const m = invite.trim().match(/^([A-Za-z0-9]{4}-?[A-Za-z0-9]{4}|[A-Za-z0-9]{3}-?[A-Za-z0-9]{3})@([^\s#]+)(?:#([\w+/=-]{43,44}))?$/)
   if (!m) throw new Error('an invite looks like HX7-K92@192.168.1.129:8787#k3Jq…')
   const addr = m[2].replace(/\/+$/, '')
   const pin = m[3]
@@ -43,13 +45,104 @@ export function installCommand(port: number, cert?: string) {
   return cert ? `curl -fsSLk --pinnedpubkey sha256//${pinOf(cert)} https://${host}:${port}/install | sh` : `curl -fsSL http://${host}:${port}/install | sh`
 }
 
+/** Throws if `file` exists and is not a regular file (a symlink could point anywhere on this Mac). */
+function regularOrAbsent(file: string) {
+  let st
+  try {
+    st = lstatSync(file)
+  } catch {
+    return
+  }
+  if (!st.isFile()) throw new Error(`${file} is a symlink or not a regular file; not touching it`)
+}
+
+/** Writes a file by renaming a temp file over it: never follows a symlink at `file`. */
+function replaceFile(file: string, bytes: Uint8Array | string) {
+  regularOrAbsent(file)
+  const tmp = `${dirname(file)}/.synchack-${randomBytes(6).toString('hex')}.tmp`
+  try {
+    writeFileSync(tmp, bytes, { flag: 'wx' })
+    renameSync(tmp, file)
+  } finally {
+    rmSync(tmp, { force: true })
+  }
+}
+
 /** ~/<project name>, or ~/<name>-2 … when that folder already holds something. */
 export function freeFolder(name: string) {
-  const base = join(homedir(), name.replace(/[/\0]/g, '-'))
+  const safe = printable(name).normalize('NFC').replace(/[^\p{L}\p{N} _-]+/gu, '-').replace(/^[-\s]+|[-\s]+$/g, '').slice(0, 80) || 'project'
+  const base = join(homedir(), safe)
   for (let i = 1; ; i++) {
     const dir = i === 1 ? base : `${base}-${i}`
     if (!existsSync(dir) || readdirSync(dir).every(f => f === '.DS_Store')) return dir
   }
+}
+
+export interface SharePreview {
+  files: number
+  bytes: number
+  secrets: string[] // .env, keys: never leave this Mac
+  skipped: string[] // ignored folders and files (top level of each)
+  tooBig: string[] // over 100 MB, not synced
+  git: boolean
+  truncated?: boolean // stopped counting: far too many entries for a project
+}
+
+const PREVIEW_LIMIT = 20_000 // entries visited before the preview gives up (a home folder has millions)
+
+/** What sharing an existing folder would send, and what stays on this Mac. Reads only. */
+export function previewShare(dir: string): SharePreview {
+  let rules = ''
+  try {
+    rules = readFileSync(join(dir, '.synchackignore'), 'utf8')
+  } catch {}
+  const ignored = ignoreRules(rules)
+  const out: SharePreview = { files: 0, bytes: 0, secrets: [], skipped: [], tooBig: [], git: existsSync(join(dir, '.git')) }
+  let visited = 0
+  const walk = (rel: string) => {
+    if (out.truncated) return
+    let entries
+    try {
+      entries = readdirSync(join(dir, rel), { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      if (++visited > PREVIEW_LIMIT) return void (out.truncated = true)
+      const path = (rel ? rel + '/' : '') + e.name.normalize('NFC')
+      const isDir = e.isDirectory()
+      if (!isDir && !e.isFile()) continue
+      if (ignored(path, isDir)) {
+        if (['.ds_store', '.git', '.synchack'].includes(e.name.toLowerCase())) continue
+        ;(secret(path) ? out.secrets : out.skipped).push(isDir ? `${path}/` : path)
+      } else if (isDir) walk(path)
+      else {
+        const size = statSync(join(dir, path)).size
+        if (size > MAX_FILE) out.tooBig.push(path)
+        else (out.files++, (out.bytes += size))
+      }
+    }
+  }
+  walk('')
+  return out
+}
+
+/** The preview as short lines, tagged so the UI can colour them. */
+export function previewLines(x: SharePreview): ['ok' | 'safe' | 'skip' | 'info' | 'warn', string][] {
+  const size = x.bytes < 1e6 ? `${Math.max(1, Math.round(x.bytes / 1e3))} KB` : `${(x.bytes / 1e6).toFixed(1)} MB`
+  const groups = new Map<string, number>() // "__pycache__/" ×18 rather than 18 lines
+  for (const s of x.skipped) {
+    const name = `${s.split('/').filter(Boolean).pop()}${s.endsWith('/') ? '/' : ''}`
+    groups.set(name, (groups.get(name) ?? 0) + 1)
+  }
+  const lines: ReturnType<typeof previewLines> = [['ok', `${x.files} file${x.files === 1 ? '' : 's'} (${size}) will be shared with everyone you invite`]]
+  if (x.secrets.length) lines.push(['safe', `stays on this Mac: ${x.secrets.join(', ')} (secrets never leave)`])
+  if (groups.size) lines.push(['skip', `not shared: ${[...groups].map(([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join('  ')}`])
+  if (x.git) lines.push(['info', 'git repo: teammates get the files, not the history (.git/). You keep committing from this Mac.'])
+  if (x.tooBig.length) lines.push(['warn', `over 100 MB, not shared: ${x.tooBig.join(', ')}`])
+  if (x.truncated) lines.push(['warn', `stopped counting after ${PREVIEW_LIMIT.toLocaleString('en')} entries: this looks like much more than one project`])
+  if (x.files > 3000) lines.push(['warn', `${x.files} files is a lot for live sync: exclude build or data folders in .synchackignore first`])
+  return lines
 }
 
 /** Both sides of a conflict as text with git-style markers (or a note for binaries). */
@@ -107,7 +200,7 @@ export async function restore(p: Project, prefix = '', opts: { version?: number;
     if (real !== root && !real.startsWith(root + sep)) throw new Error(`${path} resolves outside the project folder`)
     const bytes = (await call(p, 'GET', `/blobs/${hash}`)) as Buffer
     if (sha256(bytes) !== hash) throw new Error(`download of ${path} was corrupted`)
-    writeFileSync(file, bytes)
+    replaceFile(file, bytes)
   }
   if (opts.version !== undefined) {
     const path = cleanPath(prefix)
@@ -131,7 +224,10 @@ export async function restore(p: Project, prefix = '', opts: { version?: number;
 
 /** Resolves a conflict with the file as it is on this Mac now (e.g. merged by hand). */
 export async function keepLocal(p: Project, c: Conflict) {
-  const file = join(p.root, c.path)
+  const file = join(p.root, cleanPath(c.path))
+  regularOrAbsent(file)
+  const real = existsSync(file) ? realpathSync(file) : null
+  if (real && !real.startsWith(realpathSync(p.root) + sep)) throw new Error(`${c.path} resolves outside the project folder (symlink); not uploading it`)
   const bytes = existsSync(file) ? readFileSync(file) : null
   if (bytes) await call(p, 'PUT', `/blobs/${sha256(bytes)}`, bytes)
   return call(p, 'POST', `/conflicts/${c.id}/resolve`, { hash: bytes && sha256(bytes) })
@@ -147,13 +243,109 @@ function serverLog(file: string) {
   }
 }
 
+/** A `dns-sd -B` result: "14:00:23.312  Add  3  14 local.  _synchack._tcp.  Oliver (MacBook-Air)"; before 10:00 the time starts with a space. */
+export const BROWSE_LINE = /^\s*\S+\s+(Add|Rmv)\s+\d+\s+(\d+)\s+\S+\s+_synchack\._tcp\.\s+(.+)$/
+
+/** Whether pid is a running synchack: one that was killed leaves its pid behind, and macOS reuses pids. */
 export function alive(pid: number) {
   try {
     process.kill(pid, 0)
-    return true
+    return /synchack|client-core\/cli/i.test(execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' }))
   } catch {
     return false
   }
+}
+
+// ── sharing choices and files, for the interfaces ────────────────────────
+
+export interface Entry {
+  name: string
+  path: string
+  dir: boolean
+  shared: boolean // false: stays on this Mac (ignored)
+  secret: boolean // .env, keys: never shared, whatever the toggle says
+}
+
+const ignoreText = (root: string) => {
+  try {
+    return readFileSync(join(root, '.synchackignore'), 'utf8')
+  } catch {
+    return ''
+  }
+}
+
+/** One folder level of a project (or a folder about to be shared), with what is shared. */
+export function listFiles(root: string, dir = ''): Entry[] {
+  const ignored = ignoreRules(ignoreText(root))
+  const base = dir ? cleanPath(dir) : ''
+  return readdirSync(join(root, base), { withFileTypes: true })
+    .filter(e => (e.isFile() || e.isDirectory()) && !['.DS_Store', '.git', '.synchack'].includes(e.name))
+    .map(e => {
+      const path = (base ? base + '/' : '') + e.name.normalize('NFC')
+      return { name: e.name.normalize('NFC'), path, dir: e.isDirectory(), shared: !ignored(path, e.isDirectory()), secret: secret(path) }
+    })
+    .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name))
+}
+
+/**
+ * Shares or keeps one file/folder on this Mac by editing .synchackignore at the root. The file
+ * syncs, so the choice applies to the whole team. Secrets can never be shared.
+ */
+export function setShared(root: string, path: string, dir: boolean, shared: boolean) {
+  const clean = cleanPath(path)
+  if (shared && secret(clean)) throw new Error('secrets (.env, keys) always stay on each Mac')
+  regularOrAbsent(join(root, '.synchackignore'))
+  const rule = `/${clean}${dir ? '/' : ''}`
+  const lines = ignoreText(root).split('\n').filter(l => l.trim() !== rule && l.trim() !== `!${rule}`)
+  let text = lines.join('\n').replace(/\n+$/, '')
+  if (ignoreRules(text)(clean, dir) === shared) text += `${text ? '\n' : ''}${shared ? '!' : ''}${rule}`
+  replaceFile(join(root, '.synchackignore'), text ? text + '\n' : '')
+  if (ignoreRules(text)(clean, dir) === shared) throw new Error(`${clean} is inside a folder that stays on this Mac; share that folder first`)
+}
+
+/** Creates a file in a project (missing folders included). Sync picks it up like any edit. */
+export function addFile(root: string, path: string, content: Uint8Array | string = '') {
+  const clean = cleanPath(path)
+  const file = join(root, clean)
+  if (existsSync(file)) throw new Error(`${clean} already exists`)
+  mkdirSync(dirname(file), { recursive: true })
+  const real = realpathSync(dirname(file))
+  if (real !== realpathSync(root) && !real.startsWith(realpathSync(root) + sep)) throw new Error(`${clean} resolves outside the project folder`)
+  writeFileSync(file, content, { flag: 'wx' })
+  return clean
+}
+
+// ── invitations between Macs ─────────────────────────────────────────────
+
+export interface Invitation extends Inbound {
+  id: string
+  at: number
+}
+
+const codeKey = (code: string) => code.toUpperCase().replace(/[^A-Z0-9]/g, '')
+// scrypt makes guessing the code from an intercepted invitation slow (about 50 ms a guess)
+const bind = (code: string, i: Pick<Inbound, 'salt' | 'address' | 'pin' | 'project'>) =>
+  scryptSync(codeKey(code), `${i.salt}|${i.address}|${i.pin ?? ''}|${i.project}`, 32, { N: 2 ** 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 })
+
+/** Where a nearby synchack listens, from its Bonjour record: host:port and TLS key pin. */
+function resolvePeer(instance: string): Promise<{ address: string; pin?: string }> {
+  return new Promise((ok, fail) => {
+    const p = spawn('dns-sd', ['-L', instance, '_synchack._tcp', 'local'], { stdio: ['ignore', 'pipe', 'ignore'] })
+    let out = ''
+    const done = (e?: Error) => {
+      clearTimeout(timer)
+      p.kill()
+      const at = out.match(/can be reached at (\S+?)\.?:(\d+)/)
+      if (at) ok({ address: `${at[1]}:${at[2]}`, pin: out.match(/\bpin=([\w-]{43})/)?.[1] })
+      else fail(e ?? new Error(`${instance} did not answer; are you on the same network?`))
+    }
+    const timer = setTimeout(() => done(), 4000)
+    p.stdout.on('data', (d: Buffer) => {
+      out += d
+      if (/can be reached at/.test(out) && /\bpin=|\n\s*$/.test(out)) setTimeout(() => done(), 150) // the TXT line follows
+    })
+    p.on('error', e => done(e))
+  })
 }
 
 export interface HubOptions {
@@ -177,6 +369,8 @@ export class Hub extends EventEmitter {
   /** Other synchacks on this network ("Oliver (MacBook-Air)") → interfaces they were seen on. */
   readonly nearby = new Map<string, Set<string>>()
   private missing = new Set<string>()
+  /** Invitations other Macs pushed here, waiting for the code. */
+  readonly inbox: Invitation[] = []
 
   constructor(state: LocalState, opts: HubOptions = {}) {
     super()
@@ -186,7 +380,7 @@ export class Hub extends EventEmitter {
 
   async start() {
     const pid = Number(this.state.meta('daemon'))
-    if (pid && pid !== process.pid && alive(pid)) throw new Error(`synchack is already running (pid ${pid}); stop it first`)
+    if (pid && pid !== process.pid && alive(pid)) throw new Error(`synchack is already running (pid ${pid}). Stop it with: synchack stop`)
     this.state.setMeta('daemon', String(process.pid))
     if (this.opts.server) this.serverUrl = this.opts.server
     else await this.host(this.opts.port ?? DEFAULT_PORT)
@@ -199,7 +393,7 @@ export class Hub extends EventEmitter {
   private async host(port: number) {
     const tls = hostIdentity(join(this.state.home, 'tls'))
     try {
-      this.hosting = await startServer({ port, dataDir: join(this.state.home, 'server'), localCreateOnly: true, log: serverLog(join(this.state.home, 'server.log')), tls })
+      this.hosting = await startServer({ port, dataDir: join(this.state.home, 'server'), localCreateOnly: true, log: serverLog(join(this.state.home, 'server.log')), tls, inbox: i => this.received(i) })
       this.serverUrl = this.hosting.url
       this.serverCert = tls?.cert ?? null
     } catch {
@@ -278,16 +472,16 @@ export class Hub extends EventEmitter {
   // macOS's own dns-sd tool: announces this Mac and streams others' arrivals and departures.
   private discover() {
     const me = this.me
-    const announce = spawn('dns-sd', ['-R', me, '_synchack._tcp', 'local', String(this.hosting?.port ?? DEFAULT_PORT)], { stdio: 'ignore' })
+    const txt = this.serverCert && this.hosting ? [`pin=${urlPin(pinOf(this.serverCert))}`] : []
+    const announce = spawn('dns-sd', ['-R', me, '_synchack._tcp', 'local', String(this.hosting?.port ?? DEFAULT_PORT), ...txt], { stdio: 'ignore' })
     const browse = spawn('dns-sd', ['-B', '_synchack._tcp'], { stdio: ['ignore', 'pipe', 'ignore'] })
     let rest = ''
     browse.stdout.on('data', (chunk: Buffer) => {
       const lines = (rest + chunk).split('\n')
       rest = lines.pop() ?? ''
       for (const line of lines) {
-        // 14:00:23.312  Add  3  14 local.  _synchack._tcp.  Oliver (MacBook-Air)
-        const m = line.match(/^\S+\s+(Add|Rmv)\s+\d+\s+(\d+)\s+\S+\s+_synchack\._tcp\.\s+(.+)$/)
-        if (!m || m[3] === me) continue
+        const m = line.match(BROWSE_LINE)
+        if (!m || m[3].replace(/ \(\d+\)$/, '') === me || m[3].length > 120 || printable(m[3]) !== m[3]) continue // ourselves (maybe renamed "(2)"), or a hostile name
         const seen = this.nearby.get(m[3]) ?? new Set<string>()
         if (m[1] === 'Add') seen.add(m[2])
         else seen.delete(m[2])
@@ -300,11 +494,68 @@ export class Hub extends EventEmitter {
     this.bonjour = [announce, browse]
   }
 
-  async close() {
-    clearInterval(this.timer)
-    for (const p of this.bonjour) p.kill()
-    await Promise.all([...this.engines.values()].map(e => e.stop()))
-    await this.hosting?.close()
-    this.state.setMeta('daemon', '')
+  /**
+   * Anyone on the network can post an invitation (a forged one can never be joined: see bind()).
+   * So a sender may only replace its own: a resent invitation from the same address replaces the
+   * old one, another address can't push it out, and one address keeps at most 3 cards here.
+   */
+  private received(i: Inbound) {
+    if (this.inbox.some(x => x.mac === i.mac)) return // the same invitation twice
+    const same = this.inbox.findIndex(x => x.source === i.source && x.from === i.from && x.project === i.project)
+    if (same >= 0) this.inbox.splice(same, 1)
+    const mine = this.inbox.filter(x => x.source === i.source)
+    if (mine.length >= 3) this.inbox.splice(this.inbox.indexOf(mine[0]), 1)
+    this.inbox.push({ ...i, id: randomBytes(6).toString('hex'), at: Date.now() })
+    if (this.inbox.length > 20) this.inbox.shift()
+    this.emit('invitation')
+    this.emit('update')
+  }
+
+  /**
+   * Pushes an invitation to a nearby synchack ("Oliver (MacBook-Air)"). Returns the code to tell
+   * them: their synchack asks for it, and it only joins if the code matches this invitation.
+   */
+  async invite(projectId: string, peer: string) {
+    const p = this.state.project(projectId)
+    if (!p) throw new Error('no such project')
+    if (!this.nearby.has(peer)) throw new Error(`${peer} is not nearby (not on this network right now)`)
+    const { code, pin } = parseInvite(await refreshInvite(this.state, p))
+    const address = inviteFor(p).split('@')[1].split('#')[0]
+    const salt = randomBytes(16).toString('hex')
+    const body = JSON.stringify({ from: this.me, project: p.name, address, pin: pin ?? null, salt, mac: bind(code, { salt, address, pin: pin ?? null, project: p.name }).toString('hex') })
+    const them = await resolvePeer(peer)
+    const server = `${them.pin ? 'https' : 'http'}://${them.address}`
+    const cert = them.pin ? await pinnedCert(server, stdPin(them.pin)) : undefined
+    const res = await request({ server, cert }, 'POST', '/inbox', { headers: { 'content-type': 'application/json' }, body, timeoutMs: 5000 })
+    if (res.status !== 204) throw new Error(`${peer} refused the invitation (${res.status})`)
+    return code
+  }
+
+  /** Joins an invitation from the inbox, if `code` is the one shown on the inviter's screen. */
+  async accept(id: string, code: string, dir?: string) {
+    const i = this.inbox.find(x => x.id === id)
+    if (!i) throw new Error('that invitation is gone')
+    if (!timingSafeEqual(bind(code, i), Buffer.from(i.mac, 'hex'))) throw new Error(`wrong code: type the one on ${i.from.replace(/ \(.*\)$/, '')}'s screen`)
+    const p = await this.join(`${codeKey(code)}@${i.address}${i.pin ? `#${i.pin}` : ''}`, dir)
+    this.dismiss(id)
+    return p
+  }
+
+  dismiss(id: string) {
+    const at = this.inbox.findIndex(x => x.id === id)
+    if (at >= 0) this.inbox.splice(at, 1)
+    this.emit('update')
+  }
+
+  private closing?: Promise<void>
+  /** Safe to call more than once (the terminal view, a signal and the CLI may all ask). */
+  close() {
+    return (this.closing ??= (async () => {
+      clearInterval(this.timer)
+      for (const p of this.bonjour) p.kill()
+      await Promise.all([...this.engines.values()].map(e => e.stop()))
+      await this.hosting?.close()
+      this.state.setMeta('daemon', '')
+    })())
   }
 }

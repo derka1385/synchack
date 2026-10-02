@@ -2,7 +2,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createServer as createTlsServer } from 'node:https'
 import { createHash, X509Certificate } from 'node:crypto'
-import { createReadStream, readFileSync, rmSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, rmSync } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { pipeline } from 'node:stream/promises'
 import { spawn } from 'node:child_process'
@@ -44,17 +44,42 @@ export interface ServerOptions {
   log?: (line: string) => void
   /** Serve HTTPS with this key and certificate (PEM). */
   tls?: { key: string; cert: string }
+  /** Receives invitations pushed by teammates' Macs on the network (POST /inbox). */
+  inbox?: (invitation: Inbound) => void
+  /**
+   * What one member's device may do per window: ops applied and WebSocket (re)connections.
+   * Far above real use (a 1500-file import is 1500 ops); they stop one member from flooding the
+   * database or the host.
+   */
+  memberLimits?: { ops: number; connects: number; windowMs: number }
+}
+
+/** "Nolann invites you to ORVECT": where to join, bound to the join code (mac) so it can't be forged. */
+export interface Inbound {
+  from: string
+  project: string
+  address: string // host:port of the project's server
+  pin: string | null // its TLS key, url-safe base64
+  salt: string
+  mac: string // scrypt(code, salt|address|pin|project): checked against the code the guest types
+  source: string // the sender's address (set by the server, never by the sender), so one sender can't replace another's invitation
 }
 
 const MAX_UPLOADS = 16 // blob uploads in flight at once, across all clients
+const MAX_UPLOADS_PER_DEVICE = 8 // so one member can't hold every slot (clients upload 8 at a time)
+const MAX_SOCKETS_PER_DEVICE = 3 // a reconnect after a network change may leave old ones half-open
 const MAX_JSON = 2 * 1024 * 1024 // 1000 ops is about 300 KB
 
-export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 }, quota, log = () => {}, tls }: ServerOptions = {}): Promise<Server> {
+export async function startServer({ port = 8787, dataDir = 'data', localCreateOnly = false, rateLimit = { max: 20, windowMs: 10 * 60_000 }, quota, log = () => {}, tls, inbox, memberLimits = { ops: 50_000, connects: 60, windowMs: 10 * 60_000 } }: ServerOptions = {}): Promise<Server> {
   const pin = tls && createHash('sha256').update(new X509Certificate(tls.cert).publicKey.export({ type: 'spki', format: 'der' })).digest('base64')
   const store = new Store(dataDir, { quota })
   rmSync(join(dataDir, 'blobs', 'tmp'), { recursive: true, force: true }) // uploads cut off by a restart
   let uploads = 0
+  const uploadsBy = new Map<string, number>() // device -> uploads in flight
   const limiter = new RateLimit(rateLimit.max, rateLimit.windowMs)
+  const opsLimit = new RateLimit(memberLimits.ops, memberLimits.windowMs)
+  const connectLimit = new RateLimit(memberLimits.connects, memberLimits.windowMs)
+  const deviceKey = (d: Device) => `${d.project}\n${d.device}`
   const rooms = new Map<string, Map<WebSocket, { me: Device; alive: boolean }>>()
   let closing = false
 
@@ -70,9 +95,14 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
   const caller = new WeakMap<IncomingMessage, Device>()
   const handle = (req: IncomingMessage, res: ServerResponse) => {
     const start = Date.now()
+    // read now: once a refused upload tears the connection down, req.socket is null, and a throw in
+    // this listener would be uncaught and stop the whole server (anyone could trigger it)
+    const ip = req.socket?.remoteAddress ?? '-'
     res.on('close', () => {
-      const me = caller.get(req)
-      log(`${req.method} ${routeName(req.url)} ${res.statusCode} ${Date.now() - start}ms ${req.socket.remoteAddress ?? '-'}${me ? ` ${me.project} ${me.name} (${me.deviceName})` : ''}`)
+      try {
+        const me = caller.get(req)
+        log(`${req.method} ${routeName(req.url)} ${res.statusCode} ${Date.now() - start}ms ${ip}${me ? ` ${me.project} ${me.name} (${me.deviceName})` : ''}`)
+      } catch {} // logging never takes the server down
     })
     route(req, res).catch(e => {
       const status = e.status ?? (e instanceof SyntaxError ? 400 : 500)
@@ -90,22 +120,34 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     if (key === 'GET /health') return reply(res, 200, { ok: true })
     // Teammates install synchack from this Mac: curl -fsSL http://<ip>:8787/install | sh
     if (key === 'GET /install') {
-      res.writeHead(200, { 'content-type': 'text/x-shellscript' })
       const host = /^[\w.:[\]-]{1,255}$/.test(req.headers.host ?? '') ? req.headers.host : `localhost:${actual}`
-      return void res.end(installScript(`${tls ? 'https' : 'http'}://${host}`, pin))
+      const size = (await bundle()).length // the script shows progress against it
+      res.writeHead(200, { 'content-type': 'text/x-shellscript' })
+      return void res.end(installScript(`${tls ? 'https' : 'http'}://${host}`, size, pin))
     }
     if (key === 'GET /install.tgz') {
-      res.writeHead(200, { 'content-type': 'application/gzip' })
-      const tar = spawn('tar', ['-cz', '-C', APP, 'package.json', 'package-lock.json', 'shared', 'server', 'client-core'], { stdio: ['ignore', 'pipe', 'ignore'] })
-      tar.on('error', e => log(`install.tgz: ${e.message}`)) // e.g. no tar: the download just fails
-      return void pipeline(tar.stdout, res).catch(() => tar.kill())
+      const body = await bundle()
+      res.writeHead(200, { 'content-type': 'application/gzip', 'content-length': body.length })
+      return void res.end(body)
+    }
+    if (key === 'POST /inbox') {
+      if (!inbox) throw new HttpError(404, 'not accepting invitations')
+      const from = req.socket?.remoteAddress ?? ''
+      const wait = isLoopback(from) ? 0 : limiter.take(clientKey(from))
+      if (wait) throw new HttpError(429, 'too many invitations')
+      const b = await json(req)
+      const hex = (v: unknown, n: number) => typeof v === 'string' && new RegExp(`^[0-9a-f]{${n}}$`).test(v)
+      if (!hex(b.salt, 32) || !hex(b.mac, 64) || !/^[\w.:[\]-]{1,255}$/.test(String(b.address)) || (b.pin !== null && !/^[\w-]{43}$/.test(String(b.pin))))
+        throw new HttpError(400, 'malformed invitation')
+      inbox({ from: text(b.from, 'from'), project: text(b.project, 'project'), address: b.address, pin: b.pin, salt: b.salt, mac: b.mac, source: clientKey(from) || 'unknown' })
+      return reply(res, 204)
     }
     if (key === 'POST /api/projects' || key === 'POST /api/join') {
-      const ip = req.socket.remoteAddress ?? ''
+      const ip = req.socket?.remoteAddress ?? ''
       const local = isLoopback(ip)
       if (key === 'POST /api/projects' && localCreateOnly && !local) throw new HttpError(403, 'projects can only be created on the Mac that hosts them')
       if (!(local && !rateLimit.limitLoopback)) {
-        const wait = limiter.take(ip)
+        const wait = limiter.take(clientKey(ip))
         if (wait) {
           res.setHeader('retry-after', String(Math.ceil(wait / 1000)))
           throw new HttpError(429, `too many attempts; try again in ${Math.ceil(wait / 60_000)} min`)
@@ -128,6 +170,11 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     if (rest === '/ops' && req.method === 'POST') {
       const { ops } = await json(req)
       if (!Array.isArray(ops) || ops.length > 1000) throw new HttpError(400, 'ops must be an array of at most 1000')
+      const wait = opsLimit.take(deviceKey(me), ops.length)
+      if (wait) {
+        res.setHeader('retry-after', String(Math.ceil(wait / 1000)))
+        throw new HttpError(429, 'too many changes from this device; slow down')
+      }
       const { results, events } = store.applyOps(me, ops)
       for (const e of events) send(project, e)
       return reply(res, 200, { results })
@@ -146,12 +193,17 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
         return reply(res, 204)
       }
       store.reserve(project, size)
-      if (uploads >= MAX_UPLOADS) throw new HttpError(503, 'too many uploads at once; retry shortly')
+      const mine = uploadsBy.get(me.device) ?? 0
+      if (uploads >= MAX_UPLOADS || mine >= MAX_UPLOADS_PER_DEVICE) throw new HttpError(503, 'too many uploads at once; retry shortly')
       uploads++
+      uploadsBy.set(me.device, mine + 1)
       try {
         await receiveBlob(req, project, blob)
       } finally {
         uploads--
+        const left = (uploadsBy.get(me.device) ?? 1) - 1
+        if (left) uploadsBy.set(me.device, left)
+        else uploadsBy.delete(me.device)
       }
       return reply(res, 204)
     }
@@ -192,7 +244,12 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
     }
     const gone = rest.match(/^\/members\/([^/]{1,200})$/)?.[1]
     if (gone && req.method === 'DELETE') {
-      const device = decodeURIComponent(gone)
+      let device: string
+      try {
+        device = decodeURIComponent(gone)
+      } catch {
+        throw new HttpError(400, 'bad member id')
+      }
       const invite = store.removeMember(me, device)
       for (const [ws, s] of rooms.get(project) ?? []) if (s.me.device === device) ws.close(4001, 'removed from the project')
       send(project, { type: 'members', members: members(project) })
@@ -205,6 +262,7 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
   async function receiveBlob(req: IncomingMessage, project: string, hash: string) {
     const tmp = store.tempPath()
     const digest = createHash('sha256')
+    const room = store.quota - store.used(project) // the declared length can lie (or be absent): count real bytes
     let size = 0
     try {
       const fh = await open(tmp, 'w')
@@ -212,6 +270,7 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
         for await (const chunk of req as AsyncIterable<Buffer>) {
           size += chunk.length
           if (size > MAX_FILE) throw new HttpError(413, 'too large')
+          if (size > room) throw new HttpError(507, `project storage is full (${Math.round(store.quota / 1024 ** 3)} GB)`)
           digest.update(chunk)
           await fh.write(chunk)
         }
@@ -232,11 +291,20 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
   http.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://x')
     const project = url.pathname.match(/^\/api\/p\/([\w-]{1,64})\/ws$/)?.[1]
-    const me = project ? store.auth(project, url.searchParams.get('token')) : undefined
+    // Authorization header; ?token= still works for older clients
+    const me = project ? store.auth(project, bearer(req) ?? url.searchParams.get('token')) : undefined
     if (!me) return void socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
+    // every connect makes the server send the project's state: a reconnect loop must not become a flood
+    if (connectLimit.take(deviceKey(me))) return void socket.end('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n')
     wss.handleUpgrade(req, socket, head, ws => {
       const room = rooms.get(me.project) ?? new Map()
       rooms.set(me.project, room)
+      // a device keeps a few sockets at most: the oldest give way (half-open after a network change)
+      const own = [...room].filter(([, s]) => s.me.device === me.device).map(([w]) => w)
+      for (const old of own.slice(0, Math.max(0, own.length - MAX_SOCKETS_PER_DEVICE + 1))) {
+        room.delete(old)
+        old.terminate()
+      }
       room.set(ws, { me, alive: true })
       // Same tick as joining the room: nothing committed in between can be missed.
       const since = Number(url.searchParams.get('since')) || 0
@@ -299,9 +367,37 @@ export async function startServer({ port = 8787, dataDir = 'data', localCreateOn
 
 const APP = fileURLToPath(new URL('..', import.meta.url))
 
-// Plain sh: installs into ~/.synchack-app (outside node_modules, so Node runs the TypeScript as is)
-// and adds `synchack` and `/synchack` to ~/.zshrc. Running it again updates.
-const installScript = (src: string, pin?: string) => `#!/bin/sh
+// The packages synchack runs with (ws, ink, react and theirs): plain JavaScript, so they ship in the
+// download as they are. Teammates need neither npm nor the internet, and the size is known up front.
+const PACKAGES = (() => {
+  try {
+    const lock = JSON.parse(readFileSync(join(APP, 'package-lock.json'), 'utf8')).packages as Record<string, { dev?: boolean }>
+    return Object.keys(lock).filter(k => /^node_modules\/(@[^/]+\/)?[^/]+$/.test(k) && !lock[k].dev && existsSync(join(APP, k)))
+  } catch {
+    return []
+  }
+})()
+
+/** synchack as a .tgz, built at most once a minute (the route is open to the network: no tar per request). */
+let packed: { at: number; body: Promise<Buffer> } | undefined
+function bundle() {
+  if (!packed || Date.now() - packed.at > 60_000) {
+    const body = new Promise<Buffer>((ok, fail) => {
+      const tar = spawn('tar', ['-cz', '-C', APP, 'package.json', 'package-lock.json', 'shared', 'server', 'client-core', ...PACKAGES], { stdio: ['ignore', 'pipe', 'ignore'] })
+      const chunks: Buffer[] = []
+      tar.stdout.on('data', (c: Buffer) => chunks.push(c))
+      tar.on('error', fail) // e.g. no tar
+      tar.on('close', code => (code === 0 ? ok(Buffer.concat(chunks)) : fail(new Error(`tar exited with ${code}`))))
+    })
+    body.catch(() => (packed = undefined))
+    packed = { at: Date.now(), body }
+  }
+  return packed.body
+}
+
+// Plain sh: installs into ~/.synchack-app and adds `synchack`, `/synchack` and `/endsynchack` to
+// ~/.zshrc. Running it again updates. The progress bar measures bytes received out of `size`.
+const installScript = (src: string, size: number, pin?: string) => `#!/bin/sh
 set -e
 if ! command -v node >/dev/null 2>&1; then
   echo "synchack needs Node 24 or newer: install it from https://nodejs.org, then run this again."; exit 1
@@ -310,19 +406,58 @@ if [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 24 ]; then
   echo "synchack needs Node 24 or newer (you have $(node -v)): update it from https://nodejs.org"; exit 1
 fi
 APP="$HOME/.synchack-app"
-echo "Downloading synchack from ${src} ..."
+SIZE=${size}
+TTY=0; if [ -t 1 ]; then TTY=1; fi
+# one line redrawn in place: bar, percentage, what is happening (sed: macOS sh garbles █ appended in a loop)
+bar() {
+  if [ $TTY = 0 ]; then return 0; fi
+  on=$(printf "%$(($1 * 30 / 100))s" '' | sed 's/ /█/g')
+  off=$(printf "%$((30 - $1 * 30 / 100))s" '' | sed 's/ /░/g')
+  printf '\\r\\033[K  %s%s %3d%%  %s' "$on" "$off" "$1" "$2"
+}
+step() { if [ $TTY = 1 ]; then printf '\\r\\033[K'; fi; printf '  ✓ %s\\n' "$1"; }
+fail() { if [ $TTY = 1 ]; then printf '\\r\\033[K'; fi; printf '  ✗ %s\\n' "$1"; exit 1; }
+bytes() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo 0; fi; }
+
+printf '\\n  Installing SyncHack from ${src.replace(/^https?:\/\//, '')}\\n\\n'
 rm -rf "$APP" && mkdir -p "$APP"
-curl -fsSL ${pin ? `-k --pinnedpubkey 'sha256//${pin}' ` : ''}"${src}/install.tgz" | tar -xz -C "$APP"
-(cd "$APP" && npm install --omit=dev --no-audit --no-fund --no-update-notifier --loglevel=error)
+curl -fsSL ${pin ? `-k --pinnedpubkey 'sha256//${pin}' ` : ''}"${src}/install.tgz" -o "$APP/.download.tgz" &
+PID=$!
+while kill -0 $PID 2>/dev/null; do
+  B=$(bytes "$APP/.download.tgz")
+  bar $((B * 95 / SIZE)) "Downloading… $((B / 1024)) / $((SIZE / 1024)) KB"
+  sleep 0.1
+done
+wait $PID || fail "Download failed. Is synchack open on that Mac, on the same Wi-Fi?"
+bar 97 "Unpacking…"
+tar -xzf "$APP/.download.tgz" -C "$APP"
+rm -f "$APP/.download.tgz"
+step "Downloaded synchack ($((SIZE / 1024)) KB)"
+
+bar 99 "Adding /synchack to Terminal…"
 if ! grep -q 'synchack-app' "$HOME/.zshrc" 2>/dev/null; then
-  printf '\n# SyncHack\nsynchack() { node "$HOME/.synchack-app/client-core/cli.ts" "$@" }\n/synchack() { synchack "$@" }\n' >> "$HOME/.zshrc"
+  printf '\\n# SyncHack\\nsynchack() { node "$HOME/.synchack-app/client-core/cli.ts" "$@" }\\n/synchack() { synchack "$@" }\\n' >> "$HOME/.zshrc"
 fi
-echo "Done. Open a new Terminal window and type: /synchack"
+if ! grep -q '/endsynchack' "$HOME/.zshrc" 2>/dev/null; then
+  printf '/endsynchack() { synchack stop }\\n' >> "$HOME/.zshrc"
+fi
+step "Added /synchack and /endsynchack to Terminal"
+printf '\\n  Done. Open a new Terminal window and type: /synchack\\n\\n'
 `
 
 /** The route without ids or hashes, for logs. */
 const routeName = (url = '/') =>
   url.split('?')[0].replace(/^\/api\/p\/[^/]+/, '/api/p/:id').replace(/[0-9a-f]{64}/, ':hash').replace(/\/(conflicts|members)\/[^/]+/, '/$1/:id')
+
+/** Rate-limit key: an IPv4 address, or an IPv6 /64 (a single machine can rotate through a whole /64). */
+export function clientKey(ip: string) {
+  const v4 = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i)?.[1]
+  if (v4 || !ip.includes(':')) return v4 ?? ip
+  const [head, tail = ''] = ip.toLowerCase().split('::')
+  const h = head ? head.split(':') : [], t = tail ? tail.split(':') : []
+  const groups = ip.includes('::') ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t] : h
+  return `${groups.slice(0, 4).map(g => g.replace(/^0+(?=.)/, '')).join(':')}::/64`
+}
 
 const bearer = (req: IncomingMessage) => req.headers.authorization?.match(/^Bearer (.+)$/)?.[1] ?? null
 const isLoopback = (ip: string) => ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
@@ -336,15 +471,15 @@ class RateLimit {
     this.max = max
     this.windowMs = windowMs
   }
-  take(key: string) {
+  take(key: string, weight = 1) {
     const now = Date.now()
     if (this.hits.size > 10_000) for (const [k, v] of this.hits) if (v.reset <= now) this.hits.delete(k)
     const h = this.hits.get(key)
     if (!h || h.reset <= now) {
-      this.hits.set(key, { n: 1, reset: now + this.windowMs })
-      return 0
+      this.hits.set(key, { n: weight, reset: now + this.windowMs })
+      return weight > this.max ? this.windowMs : 0
     }
-    return ++h.n > this.max ? h.reset - now : 0
+    return (h.n += weight) > this.max ? h.reset - now : 0
   }
 }
 
@@ -376,7 +511,7 @@ async function json(req: IncomingMessage) {
 }
 
 function text(v: unknown, field: string) {
-  if (typeof v !== 'string' || !v.trim() || v.length > 200) throw new HttpError(400, `${field} must be a short string`)
+  if (typeof v !== 'string' || !v.trim() || v.length > 200 || /[\x00-\x1f\x7f-\x9f]/.test(v)) throw new HttpError(400, `${field} must be a short string without control characters`)
   return v.trim()
 }
 
@@ -389,6 +524,8 @@ if (import.meta.main) {
     dataDir: process.env.DATA_DIR ?? 'data',
     quota: process.env.SYNCHACK_QUOTA_GB ? Number(process.env.SYNCHACK_QUOTA_GB) * 1024 ** 3 : undefined,
     log: line => console.log(stamp(line)),
+    // Behind a reverse proxy every client arrives from loopback: rate-limit it like anyone else.
+    rateLimit: { max: 20, windowMs: 10 * 60_000, limitLoopback: true },
     // A certificate from a real CA (or your proxy's) keeps clients on their system trust store.
     tls: process.env.TLS_CERT && process.env.TLS_KEY ? { cert: readFileSync(process.env.TLS_CERT, 'utf8'), key: readFileSync(process.env.TLS_KEY, 'utf8') } : undefined,
   })

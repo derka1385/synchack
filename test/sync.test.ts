@@ -8,7 +8,7 @@ import { startServer } from '../server/server.ts'
 import { LocalState, type Project } from '../client-core/state.ts'
 import { ProjectSync, call, createProject, joinProject, runsCode } from '../client-core/engine.ts'
 import { sha256 } from '../shared/protocol.ts'
-import { restore } from '../client-core/hub.ts'
+import { keepLocal, restore } from '../client-core/hub.ts'
 
 const FAST = { liveMs: 80, calmMs: 1000, reconnectMaxMs: 300 }
 const NAMES = ['Giles', 'Oliver', 'Ada', 'Lin']
@@ -384,6 +384,45 @@ test('duplicate, stale and hostile events are harmless', async () => {
     const { results } = await call(a.p, 'POST', '/ops', { ops: [{ opId: 'x', path: '../escape.txt', baseVersion: 0, baseHash: null, hash: sha256(evil) }] })
     assert.equal(results[0].status, 'error')
     assert.equal(b.sync.stats.ops, 0)
+  } finally {
+    await t.close()
+  }
+})
+
+test('nothing outside the project folder is read, uploaded or written, even through symlinks', async () => {
+  const t = await team(2)
+  try {
+    const [a, b] = t.macs
+    const sync = b.sync as any
+    const inject = async (msg: object) => {
+      sync.enqueue(() => sync.receive(sync.ws, msg))
+      await sync.settled()
+    }
+    // B keeps a symlink in the project to a private folder (or a teammate tricked them into one).
+    const outside = join(dirname(b.root), 'private')
+    mkdirSync(outside)
+    writeFileSync(join(outside, 'id_rsa'), 'SECRET KEY\n')
+    symlinkSync(outside, join(b.root, 'keys'))
+    symlinkSync(join(outside, 'gone'), join(b.root, 'dangling'))
+    // A "remote change" naming a file behind the symlink must not make B read and upload it.
+    const evil = Buffer.from('pwned\n')
+    await call(a.p, 'PUT', `/blobs/${sha256(evil)}`, evil)
+    for (const path of ['keys/id_rsa', 'dangling/x.txt', '.GIT/hooks/pre-commit', '.g\u200cit/config', '.SyncHack/tmp/x'])
+      await inject({ type: 'change', head: { path, version: 99, hash: sha256(evil), seq: 0, device: null, author: 'evil', at: 0 } })
+    await sleep(500)
+    await b.sync.idle()
+    assert.equal(readFileSync(join(outside, 'id_rsa'), 'utf8'), 'SECRET KEY\n')
+    assert.deepEqual(readdirSync(outside).sort(), ['id_rsa'])
+    const heads = (await call(a.p, 'GET', '/heads')).heads as { path: string }[]
+    assert.deepEqual(heads.filter(h => /keys|dangling/.test(h.path)), [], 'nothing behind a symlink reached the server')
+    // The server refuses every spelling of .git and .synchack a Mac would treat as the real one.
+    const ops = ['.GIT/hooks/pre-commit', '.Git/config', '.g\u200cit/config', '.SYNCHACK/x', 'a/.Git/HEAD', 'line\nbreak.txt']
+      .map((path, i) => ({ opId: `o${i}`, path, baseVersion: 0, baseHash: null, hash: sha256(evil) }))
+    const { results } = await call(a.p, 'POST', '/ops', { ops })
+    assert.deepEqual(results.map((r: { status: string }) => r.status), ops.map(() => 'error'))
+    // "Keep this Mac's file" for a conflict never reads (and uploads) a file outside the project.
+    for (const path of ['keys/id_rsa', '../private/id_rsa'])
+      await assert.rejects(keepLocal(b.p, { id: 'x', path } as any))
   } finally {
     await t.close()
   }

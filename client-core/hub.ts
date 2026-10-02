@@ -8,9 +8,8 @@ import { homedir } from 'node:os'
 import { dirname, join, sep } from 'node:path'
 import { startServer, type Inbound, type Server } from '../server/server.ts'
 import { MAX_FILE, lanAddresses, sha256, type Conflict, type Hash } from '../shared/protocol.ts'
-import { ignoreRules, printable, secret } from '../shared/paths.ts'
 import { decode, isText, merge3 } from '../shared/merge.ts'
-import { cleanPath } from '../shared/paths.ts'
+import { cleanPath, ignoreRules, printable, secret, within } from '../shared/paths.ts'
 import { ProjectSync, call, createProject, joinProject, type SyncOptions } from './engine.ts'
 import type { LocalState, Project } from './state.ts'
 import { hostIdentity, pinOf, pinnedCert, request, stdPin, urlPin } from './net.ts'
@@ -68,13 +67,18 @@ function replaceFile(file: string, bytes: Uint8Array | string) {
   }
 }
 
-/** ~/<project name>, or ~/<name>-2 … when that folder already holds something. */
+/**
+ * ~/<project name>, or ~/<name>-2 … when that name is taken. The name comes from the creator's
+ * Mac, so it is reduced to one plain, visible folder name first (never "..", "~/.ssh", a path or
+ * "Tools.app"): letters, digits, spaces, "_" and "-" only.
+ */
 export function freeFolder(name: string) {
   const safe = printable(name).normalize('NFC').replace(/[^\p{L}\p{N} _-]+/gu, '-').replace(/^[-\s]+|[-\s]+$/g, '').slice(0, 80) || 'project'
   const base = join(homedir(), safe)
   for (let i = 1; ; i++) {
     const dir = i === 1 ? base : `${base}-${i}`
-    if (!existsSync(dir) || readdirSync(dir).every(f => f === '.DS_Store')) return dir
+    if (!existsSync(dir)) return dir
+    if (statSync(dir).isDirectory() && readdirSync(dir).every(f => f === '.DS_Store')) return dir
   }
 }
 
@@ -196,8 +200,7 @@ export async function restore(p: Project, prefix = '', opts: { version?: number;
   const write = async (path: string, hash: Hash) => {
     const file = join(root, cleanPath(path))
     mkdirSync(dirname(file), { recursive: true })
-    const real = realpathSync(dirname(file))
-    if (real !== root && !real.startsWith(root + sep)) throw new Error(`${path} resolves outside the project folder`)
+    if (!within(root, realpathSync(dirname(file)))) throw new Error(`${path} resolves outside the project folder`)
     const bytes = (await call(p, 'GET', `/blobs/${hash}`)) as Buffer
     if (sha256(bytes) !== hash) throw new Error(`download of ${path} was corrupted`)
     replaceFile(file, bytes)
@@ -213,6 +216,11 @@ export async function restore(p: Project, prefix = '', opts: { version?: number;
   const { heads } = (await call(p, 'GET', '/heads')) as { heads: { path: string; hash: Hash | null }[] }
   const restored: string[] = []
   for (const h of heads) {
+    try {
+      cleanPath(h.path)
+    } catch {
+      continue
+    }
     if (!under(h.path) || existsSync(join(root, h.path))) continue
     const hash = h.hash ?? (await last(h.path))
     if (!hash) continue
@@ -224,11 +232,12 @@ export async function restore(p: Project, prefix = '', opts: { version?: number;
 
 /** Resolves a conflict with the file as it is on this Mac now (e.g. merged by hand). */
 export async function keepLocal(p: Project, c: Conflict) {
-  const file = join(p.root, cleanPath(c.path))
-  regularOrAbsent(file)
-  const real = existsSync(file) ? realpathSync(file) : null
-  if (real && !real.startsWith(realpathSync(p.root) + sep)) throw new Error(`${c.path} resolves outside the project folder (symlink); not uploading it`)
-  const bytes = existsSync(file) ? readFileSync(file) : null
+  const root = realpathSync(p.root)
+  const file = join(root, cleanPath(c.path))
+  const st = lstatSync(file, { throwIfNoEntry: false })
+  // only a regular file that really is inside the project: never one behind a symlink
+  if (st && (!st.isFile() || !within(root, realpathSync(file)))) throw new Error(`${c.path} is not a plain file inside the project`)
+  const bytes = st ? readFileSync(file) : null
   if (bytes) await call(p, 'PUT', `/blobs/${sha256(bytes)}`, bytes)
   return call(p, 'POST', `/conflicts/${c.id}/resolve`, { hash: bytes && sha256(bytes) })
 }

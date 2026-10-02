@@ -311,14 +311,14 @@ test('SEC-13 restore, keep-my-file and share toggles never follow a symlink out 
     await t.a.sync.stop()
     rmSync(join(t.a.root, 'notes.md'))
     symlinkSync(outside, join(t.a.root, 'notes.md'))
-    await assert.rejects(restore(t.a.p, 'notes.md', { version: 1, force: true }), /symlink|not a regular file/i)
+    await assert.rejects(restore(t.a.p, 'notes.md', { version: 1, force: true }), /symlink|not a (regular|plain) file/i)
     assert.equal(readFileSync(outside, 'utf8'), 'original\n')
     // .synchackignore as a link to a file outside
     symlinkSync(outside, join(t.a.root, '.synchackignore'))
-    assert.throws(() => setShared(t.a.root, 'x', false, false), /symlink|not a regular file/i)
+    assert.throws(() => setShared(t.a.root, 'x', false, false), /symlink|not a (regular|plain) file/i)
     assert.equal(readFileSync(outside, 'utf8'), 'original\n')
     // keep-my-file on a conflict whose path is a link to a secret
-    await assert.rejects(keepLocal(t.a.p, { id: 'nope', path: 'notes.md' } as never), /symlink|not a regular file/i)
+    await assert.rejects(keepLocal(t.a.p, { id: 'nope', path: 'notes.md' } as never), /symlink|not a (regular|plain) file/i)
   } finally {
     await t.close()
   }

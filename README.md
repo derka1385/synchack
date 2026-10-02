@@ -296,6 +296,23 @@ while the file was held are merged on top of the resolution, never dropped.
   per project (`SYNCHACK_QUOTA_GB` on a separate server). JSON bodies are capped at 2 MB, ops at
   1000 per request, WebSocket messages from clients at 4 KB. Each member's device gets 50 000 file
   changes and 60 connections per 10 minutes, 3 open connections and 8 uploads at once.
+- **Confined to the project folder.** Nothing a teammate sends can make synchack read, write or
+  delete anything outside the shared folder, on the server or on any Mac:
+  - every path is checked on the server and again on each receiving Mac (`cleanPath`): no `..`,
+    absolute paths, control characters, and no `.git` or `.synchack` in any spelling a Mac treats
+    as the same folder (`.GIT`, `.Git`, `.g\u200cit`…), so nobody can plant a git hook;
+  - writes and deletions resolve every folder on the way, before and again right before the
+    final rename, and refuse anything that lands outside (a symlinked or dangling-symlink folder);
+  - reads do the same, so a crafted change can't make a Mac upload a file that sits behind a
+    symlink (say `keys -> ~/.ssh`);
+  - symlinks themselves are never synced or followed out of the folder, and "keep this Mac's
+    file" for a conflict only ever uploads a plain file inside it;
+  - the folder a joiner's files go into is named after the project as one plain, visible folder
+    in their home (never `..`, `.ssh` or a path), whatever name the creator chose.
+
+  For a second wall, you can run synchack under macOS's `sandbox-exec` with a profile that only
+  allows writes to the project folder and `$SYNCHACK_HOME`. That is optional and not needed for
+  the guarantees above.
 - **Files that run.** Any member can change any synced file, including ones agents and tools
   execute (`.claude/`, `.vscode/`, `.github/workflows/`, `package.json`, `Makefile`, `.envrc`,
   `CLAUDE.md`…), in any letter case. Such changes from teammates wait in the app for review (see
@@ -310,8 +327,8 @@ while the file was held are merged on top of the resolution, never dropped.
 
 ## Safety measures
 
-- Every remote path goes through `cleanPath`: no `..`, absolute paths, empty segments, `.git`, or
-  NUL. The client also refuses writes that would leave the folder through a symlinked directory.
+- Every remote path goes through `cleanPath`, and every read and write is confined to the
+  project folder (see Security above).
 - Uploaded blobs are verified against their hash, and downloads are verified before writing.
 - If the project folder disappears (moved, unmounted), sync stops. It is never read as "everything was deleted".
 - A file replaced by a folder (or the reverse), folder moves, and case-only renames on APFS

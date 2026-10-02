@@ -2,7 +2,12 @@
 
 /** Never synced at any depth, whatever .synchackignore says. Compared case-insensitively: APFS is. */
 const HARD = new Set(['.git', '.synchack'])
-const hard = (segment: string) => HARD.has(segment.toLowerCase())
+/**
+ * A name as macOS compares it: APFS and HFS+ ignore case, and HFS+ also ignores invisible
+ * characters such as U+200C, so ".GIT" and ".g\u200cit" are the folder ".git" on a Mac.
+ */
+const fold = (name: string) => name.normalize('NFC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').toLowerCase()
+const hard = (name: string) => HARD.has(fold(name))
 
 /** Folders whose whole content is credentials. */
 const SECRET_DIRS = new Set(['.ssh', '.aws', '.gnupg'])
@@ -67,7 +72,8 @@ export const DEFAULT_IGNORE = [
 
 /**
  * Canonical relative POSIX path in NFC, or throws. The result cannot climb out of a root, reach
- * .git or .synchack in any letter case, or carry control characters (terminal escapes in logs).
+ * .git or .synchack in any spelling macOS treats as the same folder, or carry control characters
+ * (terminal escapes in logs).
  */
 export function cleanPath(p: unknown): string {
   if (typeof p !== 'string') throw new Error('path must be a string')
@@ -80,6 +86,18 @@ export function cleanPath(p: unknown): string {
 
 /** Display-safe text: drops control characters (terminal escapes) from names that came over the network. */
 export const printable = (s: string) => s.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '')
+
+/** Whether the absolute path `real` (already symlink-resolved) is `root` or inside it. */
+export const within = (root: string, real: string) => real === root || real.startsWith(root.endsWith('/') ? root : root + '/')
+
+/**
+ * A safe folder name for a project name chosen on another Mac: one plain path segment that is
+ * not hidden, so it can't be "..", "~/.ssh" or a path. Falls back to "project".
+ */
+export function folderName(name: string) {
+  const n = name.normalize('NFC').replace(/[\x00-\x1f\x7f/:\\]/g, '-').replace(/^[\s.]+/, '').trim().slice(0, 100).trim()
+  return n || 'project'
+}
 
 export type Ignore = (path: string, isDir?: boolean) => boolean
 
